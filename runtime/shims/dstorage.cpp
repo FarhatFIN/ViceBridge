@@ -8,8 +8,14 @@
 //   - Each queue has one worker thread that runs its submitted entries in order: a request reads a file range or
 //     copies a memory range into the destination, a status entry, fence signal or event runs when every entry before
 //     it has. Completion is therefore in queue order, as the API guarantees.
-//   - zlib, BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages
-//     between execute_request's read and its destination write).
+//   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
+//     the runtime's RFC 1950 inflater (leonida::zlib_inflate, src/shader_library.h) and copies the result to the
+//     destination only when it is exactly DestinationSize bytes; a stream that fails leaves the destination as it was.
+//   - A DestinationIsPhysicalPages request names its destination by 64 KiB page numbers of XMemAllocatePhysicalPages
+//     and a byte offset into the first one. The data is staged and written through the pages' backing
+//     (rt::xmem::write_physical_pages), so the pages need not be mapped.
+//   - BCPack, swizzle and SourceIsPhysicalPages requests fail with E_NOTIMPL for now (later PRs: BCPack and swizzle
+//     become stages between the read and the destination write, BCPack after the inflate).
 // Nothing here goes online or touches the GPU.
 #include <windows.h>
 #include <d3d12.h>
@@ -29,8 +35,10 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../src/shader_library.h"  // leonida::zlib_inflate
 #include "dstorage_xs_abi.h"
 #include "shims.h"
+#include "xmem_pages.h"
 
 using namespace dsx;
 
@@ -777,22 +785,33 @@ private:
         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
-        if (options::zlib(o) || options::bcpack(o) != 0 || options::swizzle(o) != 0) {
-            log_once("decompress", "zlib, BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
+        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
+            log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
-        if (o & (options::kDestinationPages | options::kSourcePages)) {
-            log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
+        if (o & options::kSourcePages) {
+            log_once("pages", "requests whose source is physical pages are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
-        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;  // only zlib + BCPack use it
-        if (r.DestinationSize != r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        const bool pages = (o & options::kDestinationPages) != 0;
+        const bool zlib = options::zlib(o);
+        // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
+        // it is 0 for every request that gets here (BCPack is refused above).
+        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        // E_DSTORAGE_INVALID_DESTINATION_SIZE: without decompression DestinationSize must equal the source's length,
+        // with it it must be larger (dstorageerr.h's description; DSTORAGE_REQUEST says the same of DestinationSize).
+        if (zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize)
+            return E_DSTORAGE_INVALID_DESTINATION_SIZE;
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
         const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
         if (total > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
-        // DSTORAGE_REQUEST: a destination over 32 MiB is allowed only with 64 KiB or 2 MiB pages, which are not
-        // implemented yet (refused above). The source equals the destination here, so this covers both buffers.
-        if (r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
+        // DSTORAGE_REQUEST: a buffer over 32 MiB is allowed only with 64 KiB or 2 MiB pages. A physical-page
+        // destination is 64 KiB pages; the page size behind an address is not known here, so an address keeps the
+        // limit. The source is never larger than the destination here (the same size without zlib, smaller with it),
+        // so this covers both buffers, and with kMaxRequestBytes above it bounds every staging buffer.
+        if (!pages && r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
+        // DSTORAGE_REQUEST: with ZlibDecompress the file offset must be 16-byte aligned.
+        if (zlib && !memory && r.FileOffset % 16 != 0) return E_DSTORAGE_INVALID_FILE_OFFSET;
         if (!r.Destination) return E_INVALIDARG;
         if (memory) {
             if (!r.Source) return E_INVALIDARG;
@@ -800,19 +819,121 @@ private:
             if (!r.File) return E_INVALIDARG;
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
+        if (zlib) return inflate_request(e, memory);
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
-        if (memory) {
+        if (!pages) {
+            if (memory) {
 #ifdef LEONIDA_DSTORAGE_TEST_HOOKS
-            if (const auto hook = g_before_copy.load(std::memory_order_acquire)) hook(r.Source);
+                if (const auto hook = g_before_copy.load(std::memory_order_acquire)) hook(r.Source);
 #endif
-            return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+                return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+            }
+            return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
         }
-        return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+        // Physical pages have no address to read into: the source is staged, then written to the pages.
+        std::vector<uint8_t> staged;
+        try {
+            staged.resize(r.SourceSize);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        if (memory) {
+            if (!guarded_move(staged.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
+        } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, staged.data(), r.SourceSize);
+                   FAILED(hr)) {
+            return hr;
+        }
+        return write_destination(r, staged.data(), staged.size());
+    }
+
+    // The last step of a request: `size` bytes of the shim's own buffer go to the destination. For a
+    // DestinationIsPhysicalPages request that is DestinationPageArray, entries of 64 KiB page numbers, starting
+    // DestinationPageOffset bytes into the first (a UINT16, so always inside it). The entries the range covers are
+    // copied out of the title's array first, and every one is checked before a byte is written, so a bad array or a
+    // page that is not a live XMemAllocatePhysicalPages page leaves the pages as they were. Both are
+    // E_DSTORAGE_ACCESS_VIOLATION, the code for a destination that cannot be written.
+    static HRESULT write_destination(const DSTORAGE_REQUEST& r, const uint8_t* data, size_t size) {
+        if (!(r.Options.AsUINT64 & options::kDestinationPages))
+            return guarded_move(r.Destination, data, size) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+        if (size == 0) return S_OK;
+        log_once("destination-pages", "DestinationIsPhysicalPages requests are written through the xmem shim's pages");
+        const size_t offset = r.DestinationPageOffset;
+        const size_t count = (offset + size + rt::xmem::kPhysicalPageBytes - 1) / rt::xmem::kPhysicalPageBytes;
+        std::vector<uint64_t> page_numbers;
+        try {
+            page_numbers.resize(count);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        if (!guarded_move(page_numbers.data(), r.DestinationPageArray, count * sizeof(uint64_t)))
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        return rt::xmem::write_physical_pages(page_numbers.data(), offset, data, size) ? S_OK
+                                                                                       : E_DSTORAGE_ACCESS_VIOLATION;
+    }
+
+    // A zlib request whose checks have passed: the source (SourceSize bytes of the file or of memory) goes into a
+    // staging buffer, inflates there, and only a result of exactly DestinationSize bytes is copied to the destination.
+    // So a failed stream leaves the destination as it was, and a memory source that overlaps its destination is safe.
+    // Address destinations keep the 32 MiB limit; physical pages use the bounded request limit (execute_request).
+    // The stream is RFC 1950: the two header bytes, the deflate
+    // data, the Adler-32 of the result; bytes after the Adler-32 are not read. A failure is the matching
+    // dstorageerr.h code: a bad header (not deflate, a window over 32 KiB, a bad check value or a preset dictionary)
+    // E_DSTORAGE_ZLIB_BAD_HEADER, bad or truncated deflate data E_DSTORAGE_ZLIB_BAD_DATA, an Adler-32 mismatch
+    // E_DSTORAGE_ZLIB_PARITY_FAIL, and a stream that inflates to more or fewer bytes than DestinationSize
+    // E_DSTORAGE_DECOMPRESSION_ERROR (no code names a size mismatch; this is the header's generic one).
+    HRESULT inflate_request(const Entry& e, bool memory) {
+        const DSTORAGE_REQUEST& r = e.request;
+        std::vector<uint8_t> source, result;
+        try {
+            source.resize(r.SourceSize);
+            result.reserve(r.DestinationSize);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        if (r.SourceSize != 0) {
+            if (memory) {
+                if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
+            } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
+                       FAILED(hr)) {
+                return hr;
+            }
+        }
+        log_once("zlib", "zlib requests are inflated on the CPU (RFC 1950, leonida::zlib_inflate)");
+        set_decompression_pending(+1);
+        leonida::ZlibError why = leonida::ZlibError::none;
+        const bool inflated = leonida::zlib_inflate(source, result, r.DestinationSize, &why);
+        set_decompression_pending(-1);
+        HRESULT hr = S_OK;
+        if (!inflated) {
+            switch (why) {
+                case leonida::ZlibError::header: hr = E_DSTORAGE_ZLIB_BAD_HEADER; break;
+                case leonida::ZlibError::checksum: hr = E_DSTORAGE_ZLIB_PARITY_FAIL; break;
+                case leonida::ZlibError::limit: hr = E_DSTORAGE_DECOMPRESSION_ERROR; break;  // longer than the destination
+                default: hr = E_DSTORAGE_ZLIB_BAD_DATA; break;
+            }
+        } else if (result.size() != r.DestinationSize) {
+            hr = E_DSTORAGE_DECOMPRESSION_ERROR;  // shorter than the destination
+        }
+        if (FAILED(hr)) {
+            std::lock_guard lock(stats().mutex);
+            ++stats().s.DecompressionErrors;
+            return hr;
+        }
+        return write_destination(r, result.data(), result.size());
     }
 
     void set_pending(int delta) {
         std::lock_guard lock(stats().mutex);
         priority_stats(stats().s, desc_.Priority).PendingRequestCount += static_cast<uint32_t>(delta);
+    }
+
+    // PendingDecompressionRequestCount is the zlib requests being inflated; TotalDecompressionRequestCount counts each
+    // one that reached its inflate (its source was read), DecompressionErrors those whose stream then failed.
+    static void set_decompression_pending(int delta) {
+        std::lock_guard lock(stats().mutex);
+        auto& s = stats().s;
+        s.PendingDecompressionRequestCount += static_cast<uint32_t>(delta);
+        if (delta > 0) ++s.TotalDecompressionRequestCount;
     }
 
     void describe(const Entry& e, DSTORAGE_ERROR_FIRST_FAILURE& f) const {

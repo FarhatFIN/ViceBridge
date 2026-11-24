@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -400,10 +401,13 @@ void test_reads_and_errors(Env& env) {
         cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "DestinationSize differs from SourceSize"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.ZlibDecompress = 1;
-        cases.push_back({r, E_NOTIMPL, "zlib is not implemented yet"});
+        cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "zlib with DestinationSize equal to SourceSize"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC1;
         cases.push_back({r, E_NOTIMPL, "BCPack is not implemented yet"});
+        r = file_request(b, 0, few.data(), 8);
+        r.Options.SwizzleMode = DSTORAGE_SWIZZLE_MODE_4K_4K_8K;
+        cases.push_back({r, E_NOTIMPL, "swizzle is not implemented yet"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.AsUINT64 = 8ull << options::kBcpackShift;
         cases.push_back({r, E_DSTORAGE_INVALID_BCPACK_MODE, "BCPack mode 8"});
@@ -414,8 +418,8 @@ void test_reads_and_errors(Env& env) {
         r.Options.Reserved = 1;
         cases.push_back({r, E_DSTORAGE_RESERVED_FIELDS, "a reserved option bit"});
         r = file_request(b, 0, few.data(), 8);
-        r.Options.DestinationIsPhysicalPages = 1;
-        cases.push_back({r, E_NOTIMPL, "physical pages are not implemented yet"});
+        r.Options.SourceIsPhysicalPages = 1;
+        cases.push_back({r, E_NOTIMPL, "a physical-page source is not implemented yet"});
         r = file_request(b, 0, few.data(), 8);
         r.IntermediateSize = 4;
         cases.push_back({r, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, "IntermediateSize without zlib and BCPack"});
@@ -970,6 +974,446 @@ void test_stats(Env& env) {
     check(st.ErrorCount > 10, "errors are counted");
 }
 
+
+// ---- zlib requests ------------------------------------------------------------------------------------------------
+//
+// Synthetic streams only. The two Huffman streams were made with Python's zlib (3.14, zlib-ng 1.3.1 API) from the
+// text zlib_text() builds, which in Python is
+//   text = lambda n: b"".join(b"line %04d: a zlib request for the queue, value %d\n" % (i, (i * i) % 97)
+//                             for i in range(n))
+// kZlibDynamic = zlib.compress(text(64), 9): one final dynamic-Huffman block (BTYPE 2), 345 bytes for 3,191.
+// kZlibFixed = zlib.compress(text(4), 1): one final fixed-Huffman block (BTYPE 1), 77 bytes for 196.
+// Streams with stored blocks (BTYPE 0) are built here by stored_stream(); for a single block that is byte for byte
+// what zlib.compress(data, 0) gives.
+constexpr uint8_t kZlibDynamic[] = {
+    0x78, 0xda, 0x95, 0xd4, 0x4d, 0x4e, 0x03, 0x31, 0x0c, 0x05, 0xe0, 0x3d, 0xa7, 0xc8, 0x01, 0x58, 0x4c, 0xfc,
+    0x97, 0x84, 0xdb, 0x14, 0x69, 0x10, 0x95, 0x46, 0x20, 0x4a, 0xcb, 0x82, 0xd3, 0x33, 0x0b, 0xf4, 0xbc, 0x7d,
+    0xee, 0x6e, 0xa4, 0x3e, 0x25, 0xce, 0x67, 0xfb, 0xb8, 0x7e, 0xec, 0x6d, 0x3b, 0x7f, 0x2f, 0xed, 0xd2, 0x7e,
+    0x8f, 0xeb, 0x6b, 0xbb, 0xed, 0x5f, 0x8f, 0xfd, 0xfb, 0xde, 0xde, 0x3e, 0x6f, 0xed, 0xfe, 0xbe, 0xb7, 0xf3,
+    0xeb, 0xb1, 0x3f, 0xb7, 0x9f, 0xcb, 0xf1, 0x38, 0xff, 0xf9, 0x74, 0xfc, 0x07, 0x3a, 0x17, 0xe8, 0x08, 0x08,
+    0x17, 0x30, 0x04, 0x94, 0x0b, 0x2c, 0x04, 0x8c, 0xbc, 0x52, 0x20, 0xe1, 0x5c, 0x42, 0x1c, 0x89, 0xe0, 0x12,
+    0x9a, 0x67, 0x0c, 0xb2, 0xee, 0xac, 0x63, 0x72, 0x89, 0xc8, 0xa7, 0x5a, 0x5c, 0x62, 0x42, 0xa3, 0x93, 0xde,
+    0x8a, 0x00, 0xe9, 0x2d, 0xb8, 0x54, 0x67, 0xc1, 0x07, 0x12, 0xa4, 0xf8, 0x10, 0x24, 0x48, 0xf2, 0x0c, 0x90,
+    0xe2, 0x9a, 0x2f, 0x45, 0x8a, 0x47, 0x9e, 0x41, 0x8a, 0x2f, 0x74, 0x55, 0x27, 0xc5, 0x35, 0x39, 0x48, 0xf1,
+    0x81, 0x81, 0x15, 0x52, 0xbc, 0xa3, 0x0e, 0x21, 0xc9, 0x1d, 0xb7, 0x12, 0x92, 0x7c, 0x61, 0x3a, 0x84, 0x24,
+    0x37, 0xb4, 0x95, 0x90, 0xe4, 0x0b, 0x82, 0x42, 0x9a, 0x5b, 0xd6, 0x41, 0x9a, 0xaf, 0xbc, 0x15, 0x69, 0xee,
+    0xe9, 0x41, 0x9a, 0x4f, 0x04, 0x48, 0xf2, 0x40, 0x5b, 0x29, 0x49, 0x2e, 0x98, 0x40, 0x25, 0xc9, 0x27, 0x6e,
+    0xa5, 0x24, 0xb9, 0xe3, 0xa9, 0x94, 0x24, 0x17, 0x34, 0xa2, 0x92, 0xe4, 0x13, 0x2b, 0x54, 0x49, 0xf2, 0x40,
+    0x93, 0x28, 0xbb, 0xd8, 0xf3, 0x75, 0x49, 0xf2, 0x9e, 0x67, 0xb0, 0xe4, 0x18, 0x0f, 0x65, 0xcd, 0x91, 0x30,
+    0xd2, 0xdc, 0x20, 0x68, 0xa4, 0xb9, 0xc2, 0xc3, 0x48, 0xf3, 0x9e, 0x67, 0x90, 0xe6, 0x59, 0x06, 0x3b, 0xe5,
+    0x98, 0x59, 0x23, 0xc9, 0x27, 0x00, 0x8d, 0x24, 0x1f, 0x68, 0x2b, 0x23, 0xc9, 0x47, 0x9e, 0x41, 0x92, 0x8f,
+    0xac, 0x63, 0x55, 0x13, 0xbe, 0x55, 0x6f, 0xe5, 0xbd, 0x5a, 0xb9, 0x4b, 0xf5, 0x75, 0x5d, 0xab, 0x82, 0x6e,
+    0xc5, 0x26, 0x71, 0xaf, 0xf6, 0xa1, 0x47, 0xb5, 0xd7, 0x7d, 0x54, 0xe7, 0xc9, 0x67, 0x75, 0x66, 0x7d, 0x55,
+    0xf7, 0x42, 0x6c, 0xd5, 0xdd, 0x13, 0xbd, 0xba, 0xdf, 0x42, 0xaa, 0x3b, 0x34, 0x94, 0xde, 0xd3, 0x7f, 0x97,
+    0x8b, 0x11, 0xce,
+};
+constexpr uint8_t kZlibFixed[] = {
+    0x78, 0x01, 0xcb, 0xc9, 0xcc, 0x4b, 0x55, 0x30, 0x30, 0x30, 0x30, 0xb0, 0x52, 0x48, 0x54, 0xa8, 0xca, 0xc9,
+    0x4c, 0x52, 0x28, 0x4a, 0x2d, 0x2c, 0x4d, 0x2d, 0x2e, 0x51, 0x48, 0xcb, 0x2f, 0x52, 0x28, 0xc9, 0x48, 0x55,
+    0x28, 0x2c, 0x4d, 0x2d, 0x4d, 0xd5, 0x51, 0x28, 0x4b, 0xcc, 0x29, 0x4d, 0x55, 0x30, 0xe0, 0x82, 0x69, 0x30,
+    0x24, 0x4e, 0x83, 0x21, 0x5c, 0x83, 0x11, 0x71, 0x1a, 0x4c, 0xe0, 0x1a, 0x8c, 0x89, 0xd3, 0x60, 0xc9, 0x05,
+    0x00, 0xb0, 0x6e, 0x40, 0x49,
+};
+
+std::vector<uint8_t> zlib_text(int lines) {
+    std::string t;
+    char line[96];
+    for (int i = 0; i < lines; ++i) {
+        std::snprintf(line, sizeof line, "line %04d: a zlib request for the queue, value %d\n", i, (i * i) % 97);
+        t += line;
+    }
+    return {t.begin(), t.end()};
+}
+
+uint32_t adler32(const std::vector<uint8_t>& data) {
+    uint32_t a = 1, b = 0;
+    for (const uint8_t x : data) {
+        a = (a + x) % 65521;
+        b = (b + a) % 65521;
+    }
+    return (b << 16) | a;
+}
+
+// A zlib stream (header 78 01) whose first block stores `stored` (a final block when there is no tail), followed by
+// the deflate blocks of the zlib stream `tail` (its header and Adler-32 dropped: a stored block ends on a byte
+// boundary, so they follow as they are) and the Adler-32 of the whole result, `stored` then `tail_plain`.
+std::vector<uint8_t> stored_stream(const std::vector<uint8_t>& stored, const uint8_t* tail = nullptr,
+                                   size_t tail_size = 0, const std::vector<uint8_t>& tail_plain = {}) {
+    const auto n = static_cast<uint16_t>(stored.size());
+    std::vector<uint8_t> z = {0x78, 0x01, static_cast<uint8_t>(tail ? 0 : 1), static_cast<uint8_t>(n),
+                              static_cast<uint8_t>(n >> 8), static_cast<uint8_t>(~n), static_cast<uint8_t>(~n >> 8)};
+    z.insert(z.end(), stored.begin(), stored.end());
+    if (tail) z.insert(z.end(), tail + 2, tail + tail_size - 4);
+    std::vector<uint8_t> plain = stored;
+    plain.insert(plain.end(), tail_plain.begin(), tail_plain.end());
+    const uint32_t check = adler32(plain);
+    for (int shift = 24; shift >= 0; shift -= 8) z.push_back(static_cast<uint8_t>(check >> shift));
+    return z;
+}
+
+// ---- DestinationIsPhysicalPages -------------------------------------------------------------------------------------
+
+// The xmem shim's exports, resolved through the registry as a title's imports are (shims/xmem.cpp has the shapes).
+using AllocatePagesFn = BOOL(WINAPI*)(uint64_t attributes, uint64_t* page_count, uint64_t* page_array);
+using FreePagesFn = BOOL(WINAPI*)(uint64_t page_count, const uint64_t* page_array);
+using XMemVirtualAllocFn = void*(WINAPI*)(void* address, SIZE_T size, DWORD type, ULONGLONG attributes, DWORD protect);
+using MapPagesFn = void*(WINAPI*)(void* address, uint64_t page_count, const uint64_t* page_array);
+
+constexpr size_t kPage = 0x10000;
+constexpr DWORD kReserve64kWindow = MEM_RESERVE | 0x20400000;  // reserve only, 64 KiB pages: a physical-page window
+
+PULONG_PTR page_array(const uint64_t* pages) { return reinterpret_cast<PULONG_PTR>(const_cast<uint64_t*>(pages)); }
+
+// A destination given as 64 KiB page numbers and an offset into the first one. Every result is read back through a
+// window the pages are mapped into, so the check is on the memory a title sees, not on the shim's own bookkeeping.
+void test_destination_pages(Env& env) {
+    const auto allocate = reinterpret_cast<AllocatePagesFn>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto free_pages = reinterpret_cast<FreePagesFn>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    const auto reserve = reinterpret_cast<XMemVirtualAllocFn>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto map_pages = reinterpret_cast<MapPagesFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    check(allocate && free_pages && reserve && map_pages, "the xmem page exports are registered");
+    if (!allocate || !free_pages || !reserve || !map_pages) return;
+
+    // Two allocations, so the pages of a request come from two backings and are not in backing order.
+    uint64_t a[4] = {}, b[2] = {};
+    uint64_t count_a = 4, count_b = 2;
+    check(allocate(0x280, &count_a, a) && count_a == 4, "allocate four pages");
+    check(allocate(0x280, &count_b, b) && count_b == 2, "allocate two more pages");
+    const uint64_t all[6] = {a[0], a[1], a[2], a[3], b[0], b[1]};
+    auto* const window = static_cast<uint8_t*>(reserve(nullptr, 6 * kPage, kReserve64kWindow, 1, PAGE_READWRITE));
+    check(window != nullptr, "reserve a six-page window");
+    if (!window) return;
+    // Only the first three are mapped while the requests run: a page needs no mapping to be a destination.
+    check(map_pages(window, 3, all) == window, "map the first three pages before the requests");
+    std::vector<uint8_t> want(6 * kPage, 0);  // what the window must hold, page i of `all` at i * 64 KiB
+    auto in_window = [&](uint64_t page) {
+        return static_cast<size_t>(std::find(std::begin(all), std::end(all), page) - std::begin(all)) * kPage;
+    };
+
+    IDStorageFileX* big = open(env, L"GAME:\\data\\big.bin");
+    IDStorageQueueX2* q = make_queue(env, 0x80, false);
+    IDStorageQueueX2* mq =
+        make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    IDStorageStatusArrayX* s = make_status(env, 16);
+
+    // 0: a file read that starts 0xF000 bytes into a[1] and runs through a[2], b[0] and into a[3].
+    const uint64_t file_pages[4] = {a[1], a[2], b[0], a[3]};
+    constexpr uint32_t kFileBytes = 0x24000;
+    constexpr uint16_t kFileOffset = 0xF000;
+    DSTORAGE_REQUEST file = file_request(big, 12345, nullptr, kFileBytes);
+    file.Options.DestinationIsPhysicalPages = 1;
+    file.DestinationPageArray = page_array(file_pages);
+    file.DestinationPageOffset = kFileOffset;
+    q->EnqueueRequest(&file);
+    q->EnqueueStatus(s, 0);
+    {
+        size_t done = 0, at = kFileOffset;
+        for (const uint64_t page : file_pages) {
+            const size_t n = (std::min)(kPage - at, kFileBytes - done);
+            std::memcpy(want.data() + in_window(page) + at, env.big.data() + 12345 + done, n);
+            done += n;
+            at = 0;
+        }
+    }
+
+    // 1: a page number that is not a live page (the second entry). Nothing may be written, the first page included.
+    const uint64_t with_dead_page[2] = {a[0], a[3] + 16 * 1000};
+    DSTORAGE_REQUEST dead = file_request(big, 0, nullptr, static_cast<uint32_t>(kPage));
+    dead.Options.DestinationIsPhysicalPages = 1;
+    dead.DestinationPageArray = page_array(with_dead_page);
+    dead.DestinationPageOffset = 0x8000;
+    q->EnqueueRequest(&dead);
+    q->EnqueueStatus(s, 1);
+
+    // 2: page number 0, which the map calls read as "unmap": not a destination.
+    const uint64_t zero_page[1] = {0};
+    DSTORAGE_REQUEST zero = file_request(big, 0, nullptr, 16);
+    zero.Options.DestinationIsPhysicalPages = 1;
+    zero.DestinationPageArray = page_array(zero_page);
+    q->EnqueueRequest(&zero);
+    q->EnqueueStatus(s, 2);
+
+    // 3: a page array the process cannot read.
+    void* unreadable = VirtualAlloc(nullptr, kPage, MEM_RESERVE, PAGE_READWRITE);
+    DSTORAGE_REQUEST bad_array = file_request(big, 0, nullptr, 16);
+    bad_array.Options.DestinationIsPhysicalPages = 1;
+    bad_array.DestinationPageArray = static_cast<PULONG_PTR>(unreadable);
+    q->EnqueueRequest(&bad_array);
+    q->EnqueueStatus(s, 3);
+
+    // 4: a zero-size request succeeds whatever its page array holds, like a zero-size read to an address.
+    DSTORAGE_REQUEST empty = file_request(big, 0, nullptr, 0);
+    empty.Options.DestinationIsPhysicalPages = 1;
+    empty.DestinationPageArray = page_array(zero_page);
+    q->EnqueueRequest(&empty);
+    q->EnqueueStatus(s, 4);
+    q->Submit();
+
+    // 5: zlib from memory into b[1], ending in a[0]: the inflated bytes, not the stream, reach the pages.
+    const std::vector<uint8_t> plain = zlib_text(64);
+    const uint64_t zlib_pages[2] = {b[1], a[0]};
+    constexpr uint16_t kZlibOffset = 0xF800;
+    DSTORAGE_REQUEST inflate{};
+    inflate.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+    inflate.Options.ZlibDecompress = 1;
+    inflate.Options.DestinationIsPhysicalPages = 1;
+    inflate.Source = kZlibDynamic;
+    inflate.SourceSize = static_cast<uint32_t>(sizeof kZlibDynamic);
+    inflate.DestinationPageArray = page_array(zlib_pages);
+    inflate.DestinationPageOffset = kZlibOffset;
+    inflate.DestinationSize = static_cast<uint32_t>(plain.size());
+    mq->EnqueueRequest(&inflate);
+    mq->EnqueueStatus(s, 5);
+    check(kZlibOffset + plain.size() > kPage, "the inflated text crosses into the second page");
+    std::memcpy(want.data() + in_window(b[1]) + kZlibOffset, plain.data(), kPage - kZlibOffset);
+    std::memcpy(want.data() + in_window(a[0]), plain.data() + (kPage - kZlibOffset),
+                plain.size() - (kPage - kZlibOffset));
+
+    // 6: a memory copy into a[3], after what request 0 left at its start.
+    const std::vector<uint8_t> tail = pattern(0x700, 31);
+    const uint64_t tail_page[1] = {a[3]};
+    DSTORAGE_REQUEST copy{};
+    copy.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+    copy.Options.DestinationIsPhysicalPages = 1;
+    copy.Source = tail.data();
+    copy.SourceSize = copy.DestinationSize = static_cast<uint32_t>(tail.size());
+    copy.DestinationPageArray = page_array(tail_page);
+    copy.DestinationPageOffset = 0xF900;  // ends exactly at the end of the page
+    mq->EnqueueRequest(&copy);
+    mq->EnqueueStatus(s, 6);
+    std::memcpy(want.data() + in_window(a[3]) + 0xF900, tail.data(), tail.size());
+    mq->Submit();
+
+    check(wait_complete(s, 4) && wait_complete(s, 6), "physical-page requests complete");
+    check_hr(s->GetHResult(0), S_OK, "a file read into four physical pages from two allocations");
+    check_hr(s->GetHResult(1), E_DSTORAGE_ACCESS_VIOLATION, "a page number that is not a live page");
+    check_hr(s->GetHResult(2), E_DSTORAGE_ACCESS_VIOLATION, "page number 0 as a destination");
+    check_hr(s->GetHResult(3), E_DSTORAGE_ACCESS_VIOLATION, "an unreadable page array");
+    check_hr(s->GetHResult(4), S_OK, "a zero-size physical-page request");
+    check_hr(s->GetHResult(5), S_OK, "zlib from memory into two physical pages");
+    check_hr(s->GetHResult(6), S_OK, "a memory copy that ends at the end of a page");
+
+    // The three pages that were mapped all along already show their bytes; the others are mapped now.
+    check(std::memcmp(window, want.data(), 3 * kPage) == 0, "pages mapped during the requests hold the data");
+    check(map_pages(window + 3 * kPage, 3, all + 3) == window + 3 * kPage, "map the other three pages");
+    check(std::memcmp(window, want.data(), want.size()) == 0,
+          "all six pages hold exactly the requests' bytes, zero elsewhere");
+
+    VirtualFree(unreadable, 0, MEM_RELEASE);
+    check(map_pages(window, 6, nullptr) == window, "unmap the window");
+    check(free_pages(4, a) && free_pages(2, b), "free the pages");
+    // A freed page is no longer a destination.
+    IDStorageStatusArrayX* after = make_status(env, 1);
+    DSTORAGE_REQUEST stale = file_request(big, 0, nullptr, 16);
+    stale.Options.DestinationIsPhysicalPages = 1;
+    stale.DestinationPageArray = page_array(tail_page);
+    q->EnqueueRequest(&stale);
+    q->EnqueueStatus(after, 0);
+    q->Submit();
+    check(wait_complete(after, 0), "the request on a freed page completes");
+    check_hr(after->GetHResult(0), E_DSTORAGE_ACCESS_VIOLATION, "a freed page as a destination");
+
+    // Over 32 MiB: allowed for a physical-page destination (64 KiB pages), refused for an address (test_memory_queue).
+    constexpr uint32_t kOver32MiB = (32u << 20) + 1;
+    constexpr uint64_t kBigPages = (kOver32MiB + kPage - 1) / kPage;
+    std::vector<uint64_t> big_pages(kBigPages);
+    uint64_t big_count = kBigPages;
+    const bool have_big = allocate(0x280, &big_count, big_pages.data()) && big_count == kBigPages;
+    check(have_big, "allocate the pages of the large request");
+    if (have_big) {
+        const std::vector<uint8_t> source = pattern(kOver32MiB, 32);
+        DSTORAGE_REQUEST over{};
+        over.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+        over.Options.DestinationIsPhysicalPages = 1;
+        over.Source = source.data();
+        over.SourceSize = over.DestinationSize = kOver32MiB;
+        over.DestinationPageArray = page_array(big_pages.data());
+        IDStorageStatusArrayX* big_status = make_status(env, 1);
+        mq->EnqueueRequest(&over);
+        mq->EnqueueStatus(big_status, 0);
+        mq->Submit();
+        check(wait_complete(big_status, 0, 60000), "the request over 32 MiB completes");
+        check_hr(big_status->GetHResult(0), S_OK, "over 32 MiB into physical pages");
+        auto* const wide =
+            static_cast<uint8_t*>(reserve(nullptr, kBigPages * kPage, kReserve64kWindow, 1, PAGE_READWRITE));
+        const bool mapped = wide != nullptr && map_pages(wide, kBigPages, big_pages.data()) == wide;
+        check(mapped, "map the large range");
+        if (mapped) {
+            check(std::memcmp(wide, source.data(), kOver32MiB) == 0, "every byte of the large copy is in the pages");
+            check(wide[kOver32MiB] == 0, "the byte after the large copy is untouched");
+            map_pages(wide, kBigPages, nullptr);
+        }
+        if (wide) VirtualFree(wide, 0, MEM_RELEASE);
+        free_pages(kBigPages, big_pages.data());
+        big_status->Release();
+    }
+
+    VirtualFree(window, 0, MEM_RELEASE);
+    after->Release();
+    s->Release();
+    mq->Release();
+    q->Release();
+    big->Release();
+}
+
+void test_zlib(Env& env) {
+    const std::vector<uint8_t> dynamic(std::begin(kZlibDynamic), std::end(kZlibDynamic));
+    const std::vector<uint8_t> fixed(std::begin(kZlibFixed), std::end(kZlibFixed));
+    const std::vector<uint8_t> dynamic_plain = zlib_text(64), fixed_plain = zlib_text(4);
+    // The first block header is the low three bits after the two header bytes: BFINAL, then BTYPE (RFC 1951 3.2.3).
+    check(dynamic.size() == 345 && (dynamic[2] & 7) == (1 | 2 << 1), "kZlibDynamic is one final dynamic block");
+    check(fixed.size() == 77 && (fixed[2] & 7) == (1 | 1 << 1), "kZlibFixed is one final fixed-Huffman block");
+    check(dynamic_plain.size() == 3191 && fixed_plain.size() == 196, "the synthetic text has the generator's sizes");
+
+    const std::vector<uint8_t> stored_part = pattern(300, 21);
+    const std::vector<uint8_t> mixed = stored_stream(stored_part, kZlibDynamic, sizeof kZlibDynamic, dynamic_plain);
+    std::vector<uint8_t> mixed_plain = stored_part;
+    mixed_plain.insert(mixed_plain.end(), dynamic_plain.begin(), dynamic_plain.end());
+    check((mixed[2] & 7) == 0, "the mixed stream starts with a stored block that is not the last");
+    const std::vector<uint8_t> stored_only = stored_stream(pattern(40, 22));  // larger than what it inflates to
+    std::vector<uint8_t> bad_method = dynamic, bad_type = fixed, bad_check = dynamic, preset = dynamic;
+    bad_method[0] ^= 1;          // CM 9: not deflate
+    preset[1] = 0xbb;            // 78 BB: a valid check value with FDICT set (a preset dictionary)
+    bad_type[2] |= 0x06;         // BTYPE 3, reserved
+    bad_check.back() ^= 1;       // the Adler-32
+
+    // One file, every stream at a 16-byte aligned offset and followed by 32 zero bytes.
+    std::vector<uint8_t> file;
+    auto put = [&](const std::vector<uint8_t>& z) {
+        const uint64_t at = file.size();
+        file.insert(file.end(), z.begin(), z.end());
+        file.resize((file.size() + 32 + 15) & ~size_t{15}, 0);
+        return at;
+    };
+    const uint64_t at_dynamic = put(dynamic), at_fixed = put(fixed), at_mixed = put(mixed),
+                   at_stored = put(stored_only), at_method = put(bad_method), at_preset = put(preset),
+                   at_type = put(bad_type), at_check = put(bad_check);
+    write_file(env.game / L"data" / L"zlib.bin", file);
+
+    struct Case {
+        uint64_t offset;
+        uint32_t source, destination;
+        HRESULT want;
+        const std::vector<uint8_t>* result;  // the expected bytes; null when the destination stays untouched
+        const char* what;
+        uint64_t options = 0;
+        uint32_t intermediate = 0;
+    };
+    const auto z = static_cast<uint32_t>(dynamic.size());
+    std::vector<Case> cases = {
+        {at_dynamic, z, 3191, S_OK, &dynamic_plain, "a zlib file request: dynamic Huffman"},
+        {at_fixed, 77, 196, S_OK, &fixed_plain, "a zlib file request: fixed Huffman"},
+        {at_mixed, static_cast<uint32_t>(mixed.size()), 3491, S_OK, &mixed_plain,
+         "a zlib file request: a stored block, then dynamic Huffman"},
+        {at_dynamic, z + 16, 3191, S_OK, &dynamic_plain, "bytes after the Adler-32 are not read"},
+        {at_stored, static_cast<uint32_t>(stored_only.size()), 40, E_DSTORAGE_INVALID_DESTINATION_SIZE, nullptr,
+         "a zlib DestinationSize not larger than SourceSize"},
+        {at_method, z, 3191, E_DSTORAGE_ZLIB_BAD_HEADER, nullptr, "a header that is not deflate"},
+        {at_preset, z, 3191, E_DSTORAGE_ZLIB_BAD_HEADER, nullptr, "a header with a preset dictionary"},
+        {at_type, 77, 196, E_DSTORAGE_ZLIB_BAD_DATA, nullptr, "a reserved block type"},
+        {at_dynamic, z - 10, 3191, E_DSTORAGE_ZLIB_BAD_DATA, nullptr, "a truncated stream"},
+        {at_check, z, 3191, E_DSTORAGE_ZLIB_PARITY_FAIL, nullptr, "an Adler-32 mismatch"},
+        {at_dynamic, z, 3192, E_DSTORAGE_DECOMPRESSION_ERROR, nullptr, "a stream shorter than DestinationSize"},
+        {at_dynamic, z, 3190, E_DSTORAGE_DECOMPRESSION_ERROR, nullptr, "a stream longer than DestinationSize"},
+        {at_dynamic + 8, z, 3191, E_DSTORAGE_INVALID_FILE_OFFSET, nullptr, "a zlib offset not 16-byte aligned"},
+        {file.size() - 16, 32, 64, E_DSTORAGE_END_OF_FILE, nullptr, "a zlib source past the end of the file"},
+        {at_dynamic, z, 3191, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, nullptr, "zlib with an IntermediateSize", 0,
+         16},
+        {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and BCPack is not implemented yet",
+         static_cast<uint64_t>(DSTORAGE_BCPACK_MODE_BC1) << options::kBcpackShift, 64},
+        {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and swizzle is not implemented yet",
+         static_cast<uint64_t>(DSTORAGE_SWIZZLE_MODE_4K_4K_8K) << options::kSwizzleShift},
+    };
+
+    DSTORAGE_STATS before{};
+    env.factory->GetStats(&before);
+    IDStorageFileX* f = open(env, L"GAME:\\data\\zlib.bin");
+    IDStorageQueueX2* q = make_queue(env, 0x80, false);
+    IDStorageStatusArrayX* s = make_status(env, static_cast<UINT32>(cases.size()));
+    constexpr size_t kSlack = 64;  // past DestinationSize: must stay untouched
+    std::vector<std::vector<uint8_t>> out(cases.size());
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const Case& c = cases[i];
+        out[i].assign(c.destination + kSlack, 0xEE);
+        DSTORAGE_REQUEST r = file_request(f, c.offset, out[i].data(), c.destination);
+        r.SourceSize = c.source;
+        r.IntermediateSize = c.intermediate;
+        r.Options.AsUINT64 = options::kZlib | c.options;
+        q->EnqueueRequest(&r);
+        q->EnqueueStatus(s, static_cast<UINT32>(i));
+    }
+    q->Submit();
+    check(wait_complete(s, static_cast<UINT32>(cases.size() - 1)), "the zlib file requests complete");
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const Case& c = cases[i];
+        check_hr(s->GetHResult(static_cast<UINT32>(i)), c.want, c.what);
+        const std::vector<uint8_t> untouched(c.destination, 0xEE);
+        const bool head = c.result ? std::equal(c.result->begin(), c.result->end(), out[i].begin())
+                                   : std::equal(untouched.begin(), untouched.end(), out[i].begin());
+        const bool tail = std::all_of(out[i].end() - kSlack, out[i].end(), [](uint8_t x) { return x == 0xEE; });
+        check(head && tail, c.result ? "the inflated bytes are the synthetic text, and nothing past them"
+                                     : "a failed zlib request leaves the destination untouched");
+    }
+    s->Release();
+    q->Release();
+    f->Release();
+
+    // A memory source: the same stream, one inflated in place (the compressed bytes sit at the end of their own
+    // destination, as a title may load them), a corrupt one, a source and a destination the process cannot touch.
+    IDStorageQueueX2* mq = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    IDStorageStatusArrayX* ms = make_status(env, 5);
+    void* reserved = VirtualAlloc(nullptr, 1 << 16, MEM_RESERVE, PAGE_READWRITE);
+    std::vector<uint8_t> m0(3191, 0xEE), in_place(3191, 0xEE), m2(3191, 0xEE), m3(3191, 0xEE);
+    std::copy(dynamic.begin(), dynamic.end(), in_place.end() - dynamic.size());
+    DSTORAGE_REQUEST r{};
+    r.Options.AsUINT64 = options::kZlib | options::kSourceMemory;
+    r.SourceSize = z;
+    r.DestinationSize = 3191;
+    r.Source = dynamic.data();
+    r.Destination = m0.data();
+    mq->EnqueueRequest(&r);
+    mq->EnqueueStatus(ms, 0);
+    r.Source = in_place.data() + in_place.size() - dynamic.size();
+    r.Destination = in_place.data();
+    mq->EnqueueRequest(&r);
+    mq->EnqueueStatus(ms, 1);
+    r.Source = bad_check.data();
+    r.Destination = m2.data();
+    mq->EnqueueRequest(&r);
+    mq->EnqueueStatus(ms, 2);
+    r.Source = reserved;
+    r.Destination = m3.data();
+    mq->EnqueueRequest(&r);
+    mq->EnqueueStatus(ms, 3);
+    r.Source = dynamic.data();
+    r.Destination = reserved;
+    mq->EnqueueRequest(&r);
+    mq->EnqueueStatus(ms, 4);
+    mq->Submit();
+    check(wait_complete(ms, 4), "the zlib memory requests complete");
+    check_hr(ms->GetHResult(0), S_OK, "a zlib memory request");
+    check(m0 == dynamic_plain, "the zlib memory request inflates to the synthetic text");
+    check_hr(ms->GetHResult(1), S_OK, "a zlib memory request whose source lies inside its destination");
+    check(in_place == dynamic_plain, "inflating in place gives the synthetic text");
+    check_hr(ms->GetHResult(2), E_DSTORAGE_ZLIB_PARITY_FAIL, "a zlib memory request with an Adler-32 mismatch");
+    check(m2 == std::vector<uint8_t>(3191, 0xEE), "the failed zlib memory request leaves the destination untouched");
+    check_hr(ms->GetHResult(3), E_DSTORAGE_ACCESS_VIOLATION, "a zlib source the process cannot read");
+    check_hr(ms->GetHResult(4), E_DSTORAGE_ACCESS_VIOLATION, "a zlib destination the process cannot write");
+    VirtualFree(reserved, 0, MEM_RELEASE);
+    ms->Release();
+    mq->Release();
+
+    // Counted when the inflate starts: the 11 file requests (4 good, 7 bad streams) and 4 memory requests (all but the
+    // unreadable source) whose checks passed and whose source was read. Failed: the 7 bad file streams and the memory
+    // one with an Adler-32 mismatch; a destination the process cannot write is not a decompression error.
+    DSTORAGE_STATS after{};
+    env.factory->GetStats(&after);
+    check(after.TotalDecompressionRequestCount - before.TotalDecompressionRequestCount == 15,
+          "TotalDecompressionRequestCount counts the zlib requests that reached the inflate");
+    check(after.DecompressionErrors - before.DecompressionErrors == 8, "DecompressionErrors counts the bad streams");
+    check(after.PendingDecompressionRequestCount == 0, "no decompression is pending afterwards");
+}
+
 }  // namespace
 
 int main() {
@@ -1005,6 +1449,8 @@ int main() {
     test_iid_policy_events_and_cancel(env);
     test_stats_timing(env);
     test_stats(env);
+    test_zlib(env);  // after test_stats, whose request totals it would change
+    test_destination_pages(env);
 
     fs::remove_all(env.root, ec);
     std::printf("dstorage: %d checks, %d failures\n", g_checks, g_failures);

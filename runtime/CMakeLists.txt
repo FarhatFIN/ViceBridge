@@ -256,6 +256,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(dstorage_test
     test/dstorage_test.cpp
     shims/dstorage.cpp
+    shims/xmem.cpp
     shims/file_system.cpp
     shims/registry.cpp
   )
@@ -263,6 +264,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_DSTORAGE_TEST_HOOKS)
   target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(dstorage_test PRIVATE /OPT:NOREF)
+  target_link_libraries(dstorage_test PRIVATE psapi)
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
