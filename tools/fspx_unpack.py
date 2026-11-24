@@ -254,7 +254,14 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                code = blob[6][start:end]
+                asm, invalid, err = disasm.disasm(code, a.mcpu)
+                if asm.strip() and invalid:
+                    decoded, remaining, _ = disasm.disasm(
+                        code, a.mcpu, backend="python", wave32=meta.get("wave32", True),
+                    )
+                    if decoded.strip() and remaining == 0:
+                        asm, invalid, err = decoded, 0, ""
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)

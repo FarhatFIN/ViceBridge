@@ -1321,7 +1321,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
 
 
 FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
-FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py")   # with TRANSLATION_SOURCES, what the FSPX outputs come from
+FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py", "rdna2_decode.py", "rdna2_isa_tables.py")
 
 
 def file_sha256(path: str) -> str:

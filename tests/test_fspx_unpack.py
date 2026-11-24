@@ -179,12 +179,12 @@ class Cli(unittest.TestCase):
             code = fspx_unpack.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
-    def disassemble(self, body):
+    def disassemble(self, body, code=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         src = os.path.join(tmp.name, "one.fspx")
         with open(src, "wb") as f:
-            f.write(make_fspx([(0, kind0()), (6, program())]))
+            f.write(make_fspx([(0, kind0()), (6, program() if code is None else code)]))
         mc = os.path.join(tmp.name, "fake_mc.py")
         with open(mc, "w", encoding="utf-8", newline="\n") as f:
             f.write(body)
@@ -214,10 +214,24 @@ class Cli(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
         self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
 
-    def test_disassembly_with_invalid_words_keeps_listing(self):
+    def test_disassembly_with_invalid_words_uses_a_complete_python_listing(self):
         result, out = self.disassemble("import sys\n"
                                        "print('\\ts_endpgm')\n"
                                        "sys.stderr.write('warning: invalid instruction encoding\\n')\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
+            listing = f.read()
+        self.assertIn("0 invalid words", listing)
+        self.assertIn("v_mov_b32", listing)
+        self.assertNotIn("warning: invalid instruction encoding", listing)
+
+    def test_disassembly_with_invalid_words_keeps_listing_when_both_decoders_fail(self):
+        unknown = struct.pack("<I", 0xFFFFFFFF)
+        result, out = self.disassemble("import sys\n"
+                                       "print('\\ts_endpgm')\n"
+                                       "sys.stderr.write('warning: invalid instruction encoding\\n')\n",
+                                       code=prologue() + unknown + ENDPGM)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
         with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:

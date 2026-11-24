@@ -167,8 +167,9 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
 
 **Build.** `make_game.py`'s `shaders` stage, after the game's own shaders, runs `tools/fspx_unpack.py --disasm` on
 the package's `amd_fidelityfx_upscaler_xbox.dll` into `<work>/shaders/fspx/` and `tools/rdna2spirv.py` on that
-disassembly into `<work>/shaders/spirv/fspx/`, with the same `--wave64-emulate` and fallback flags. Each index entry
-of a program without an FSSM blob gets two keys (`tools/shader_meta.py`):
+disassembly into `<work>/shaders/spirv/fspx/`, with the same `--wave64-emulate` and fallback flags. If LLVM reports
+invalid instructions, the unpacker retries with the built-in RDNA2 decoder and uses its listing after a complete
+decode. Each index entry of a program without an FSSM blob gets two keys (`tools/shader_meta.py`):
 
 - `fspx_code_sha256`, the SHA-256 of `fspx/<name>.code`: the whole kind-6 entry, prologue and padding included;
 - `fspx_state_sha256`, the SHA-256 of `fspx/<name>.state`: the kind-0 entry (dispatch state) as it is.
