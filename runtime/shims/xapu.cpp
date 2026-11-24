@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <new>
 #include <set>
@@ -25,7 +26,10 @@ struct ApuConnection {
 };
 
 std::mutex g_connections_mutex;
-std::set<ApuConnection*> g_connections;
+// Measured callers pass the handle back without dereferencing it. A deleted connection pointer can be reused by
+// the allocator, making a stale handle control a later connection. Process-lifetime IDs are never reused.
+std::map<uintptr_t, ApuConnection> g_connections;
+uintptr_t g_next_connection = 1;
 
 // Trace each API once with its caller without reading unsupported command structures.
 void note(const char* api, uint64_t value, const void* caller) {
@@ -48,21 +52,19 @@ HRESULT __stdcall XApuConnect(void* out24, void* out16, void** handle) {
     *handle = nullptr;
     void* buffer = VirtualAlloc(nullptr, kApuBufferSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);  // zeroed
     if (!buffer) return E_OUTOFMEMORY;
-    *handle = new (std::nothrow) ApuConnection{buffer};  // a throwing new would unwind into the title
-    if (!*handle) {
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return E_OUTOFMEMORY;
-    }
     {
         std::lock_guard lock(g_connections_mutex);
+        if (g_next_connection == 0) {
+            VirtualFree(buffer, 0, MEM_RELEASE);
+            return HRESULT_FROM_WIN32(ERROR_TOO_MANY_OPEN_FILES);
+        }
         try {
-            g_connections.insert(static_cast<ApuConnection*>(*handle));
+            g_connections.emplace(g_next_connection, ApuConnection{buffer});
         } catch (const std::bad_alloc&) {
             VirtualFree(buffer, 0, MEM_RELEASE);
-            delete static_cast<ApuConnection*>(*handle);
-            *handle = nullptr;
             return E_OUTOFMEMORY;
         }
+        *handle = reinterpret_cast<void*>(g_next_connection++);
     }
     if (out24) std::memset(out24, 0, 24);
     if (out16) {
@@ -74,19 +76,18 @@ HRESULT __stdcall XApuConnect(void* out24, void* out16, void** handle) {
 
 HRESULT __stdcall XApuDisconnect(void* handle) {
     note("XApuDisconnect", 0, _ReturnAddress());
-    auto* c = static_cast<ApuConnection*>(handle);
     std::lock_guard lock(g_connections_mutex);
-    if (!c || !g_connections.count(c)) return E_HANDLE;
-    if (!VirtualFree(c->buffer, 0, MEM_RELEASE)) return HRESULT_FROM_WIN32(GetLastError());
-    g_connections.erase(c);
-    delete c;
+    const auto connection = g_connections.find(reinterpret_cast<uintptr_t>(handle));
+    if (connection == g_connections.end()) return E_HANDLE;
+    if (!VirtualFree(connection->second.buffer, 0, MEM_RELEASE)) return HRESULT_FROM_WIN32(GetLastError());
+    g_connections.erase(connection);
     return S_OK;
 }
 
 HRESULT __stdcall XApuEnqueueCommand(void* handle, const uint32_t* command, uint64_t flags) {
     note("XApuEnqueueCommand", 0, _ReturnAddress());
     std::lock_guard lock(g_connections_mutex);
-    if (!g_connections.count(static_cast<ApuConnection*>(handle))) return E_HANDLE;
+    if (!g_connections.count(reinterpret_cast<uintptr_t>(handle))) return E_HANDLE;
     if (!command || flags != 0) return E_INVALIDARG;
     // No DSP decoder exists: an accepted command would promise a result that cannot be produced.
     static std::once_flag warning;
@@ -97,7 +98,7 @@ HRESULT __stdcall XApuEnqueueCommand(void* handle, const uint32_t* command, uint
 uint32_t __stdcall XApuGetResultCount(void* handle, uint64_t flags) {
     note("XApuGetResultCount", 0, _ReturnAddress());
     std::lock_guard lock(g_connections_mutex);
-    if (!g_connections.count(static_cast<ApuConnection*>(handle))) SetLastError(ERROR_INVALID_HANDLE);
+    if (!g_connections.count(reinterpret_cast<uintptr_t>(handle))) SetLastError(ERROR_INVALID_HANDLE);
     else if (flags != 0) SetLastError(ERROR_INVALID_PARAMETER);
     else SetLastError(ERROR_SUCCESS);
     return 0;  // No command was accepted, so no result can be available.
@@ -106,7 +107,7 @@ uint32_t __stdcall XApuGetResultCount(void* handle, uint64_t flags) {
 HRESULT __stdcall XApuDequeueResult(void* handle, void* result) {
     note("XApuDequeueResult", 0, _ReturnAddress());
     std::lock_guard lock(g_connections_mutex);
-    if (!g_connections.count(static_cast<ApuConnection*>(handle))) return E_HANDLE;
+    if (!g_connections.count(reinterpret_cast<uintptr_t>(handle))) return E_HANDLE;
     if (!result) return E_POINTER;
     return E_PENDING;  // Output remains untouched: there is no decoded result to copy.
 }
