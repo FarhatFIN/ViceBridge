@@ -15,7 +15,6 @@
 
 #include <cstdio>
 #include <deque>
-#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -92,19 +91,13 @@ std::string module_name(std::string path) {
 }
 
 std::string host_module_name(HMODULE module) {
-    std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
-    if (auto it = names->find(module); it != names->end()) return it->second;
-
+    // A host module may unload and another image can reuse the same HMODULE.
+    // Resolve its current name for each lookup to avoid selecting a stale shim.
     std::vector<wchar_t> path(MAX_PATH);
     for (;;) {
         const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
         if (!length) return {};
-        if (length < path.size()) {
-            const std::string name = module_name(narrow(path.data()));
-            names->emplace(module, name);
-            return name;
-        }
+        if (length < path.size()) return module_name(narrow(path.data()));
         if (path.size() == 32768) return {};
         path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
     }
