@@ -18,3 +18,9 @@ The full inherited test suites and game startup were not run. Original generated
 
 Next priorities: prove an audio decoder/command contract, implement native texture layout and uploads, complete
 runtime BCPack/swizzle and continue synthetic boot-chain verification. Do not treat bound import counts as readiness.
+
+DirectStorage follow-up: guarded diagnostic request-name reads so an inaccessible name cannot crash the worker
+while reporting a rejected request. A synthetic unreadable-name regression reproduced an unhandled Wine page fault
+before the fix; the targeted dstorage CTest passed after it, preserving E_INVALIDARG and omitting the unreadable name.
+The test target rebuilt successfully. Full-file clang-format checking reports existing formatting violations;
+no broad formatting rewrite was applied. No additional streaming feature or game-startup verification is claimed.

@@ -1414,6 +1414,31 @@ void test_zlib(Env& env) {
     check(after.PendingDecompressionRequestCount == 0, "no decompression is pending afterwards");
 }
 
+void test_unreadable_request_name(Env& env) {
+    auto* q = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    auto* s = make_status(env, 1);
+    void* unreadable = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_NOACCESS);
+    check(unreadable != nullptr, "reserve unreadable request name");
+    if (unreadable) {
+        DSTORAGE_REQUEST r{};
+        r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+        r.Name = static_cast<const char*>(unreadable);
+        q->EnqueueRequest(&r);  // Invalid destination forces diagnostic-name collection.
+        q->EnqueueStatus(s, 0);
+        q->Submit();
+        check(wait_complete(s, 0), "an unreadable diagnostic name does not stop queue completion");
+        check_hr(s->GetHResult(0), E_INVALIDARG, "the original request error is preserved");
+        q->Close();
+        DSTORAGE_ERROR_RECORD rec{};
+        q->RetrieveErrorRecord(&rec);
+        check(rec.FailureCount == 1 && rec.FirstFailure.Request.Name[0] == '\0',
+              "an unreadable diagnostic name is omitted from the error record");
+        VirtualFree(unreadable, 0, MEM_RELEASE);
+    }
+    s->Release();
+    q->Release();
+}
+
 }  // namespace
 
 int main() {
@@ -1451,6 +1476,7 @@ int main() {
     test_stats(env);
     test_zlib(env);  // after test_stats, whose request totals it would change
     test_destination_pages(env);
+    test_unreadable_request_name(env);
 
     fs::remove_all(env.root, ec);
     std::printf("dstorage: %d checks, %d failures\n", g_checks, g_failures);

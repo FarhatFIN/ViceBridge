@@ -420,6 +420,21 @@ bool guarded_move(void* destination, const void* source, size_t size) {
     }
 }
 
+// Diagnostic text must not turn a rejected request into an unhandled worker exception.
+void guarded_request_name(char* destination, const char* source) {
+    if (!source) return;
+    __try {
+        for (size_t i = 0; i + 1 < kRequestMaxName; ++i) {
+            const char c = source[i];
+            destination[i] = c;
+            if (c == '\0') return;
+        }
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                               : EXCEPTION_CONTINUE_SEARCH) {
+        destination[0] = '\0';
+    }
+}
+
 HRESULT read_error(DWORD error) {
     switch (error) {
         case ERROR_NOACCESS:
@@ -954,8 +969,7 @@ private:
                     if (e.file) wcsncpy_s(q.Filename, e.file->path().c_str(), _TRUNCATE);
                 }
                 // The reference says the name stays readable until the request completes.
-                if (r.Name)
-                    for (size_t i = 0; i + 1 < kRequestMaxName && r.Name[i]; ++i) q.Name[i] = r.Name[i];
+                guarded_request_name(q.Name, r.Name);
                 break;
             }
             case Entry::Type::Status:
