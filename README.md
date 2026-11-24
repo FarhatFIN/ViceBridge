@@ -1,5 +1,9 @@
 # ViceBridge
 
+<p align="center">
+  <img src="assets/vicebridge-logo.png" alt="ViceBridge logo" width="720">
+</p>
+
 An independent experimental Xbox Series-to-PC compatibility project, maintained by **FarhatFIN**.
 Based on the preserved Leonida source history and our local compatibility work.
 
