@@ -1018,7 +1018,10 @@ Module& Loader::load(const std::filesystem::path& image) {
         startup_trace::event("map", "\"module\":" + startup_trace::quote(m.name) +
                                         ",\"base\":" + startup_trace::quote(startup_trace::hex(reinterpret_cast<uint64_t>(m.base))) +
                                         ",\"size\":" + startup_trace::quote(startup_trace::hex(m.size)) +
-                                        ",\"relocated\":" + (m.relocated ? "true" : "false"));
+                                        ",\"relocated\":" + (m.relocated ? "true" : "false") +
+                                        ",\"tls_index\":" +
+                                            (m.tls_index == kNoTlsIndex ? "null" : std::to_string(m.tls_index)) +
+                                        ",\"tls_block_size\":" + std::to_string(m.tls_block_size));
     return m;
 }
 
