@@ -911,6 +911,24 @@ void check_run_time_load() {
 int main() {
     std::printf("xgameruntime_test: the offline GDK runtime shim, through the shim registry\n");
 
+    // Exercise the first host lookup on a newly created thread before other loader tests warm its caches.
+    using EarlyGetProc = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+    const auto early_get_proc = reinterpret_cast<EarlyGetProc>(rt::shims::find("kernel32.dll", "GetProcAddress"));
+    check(early_get_proc != nullptr, "early host GetProcAddress shim exists");
+    struct EarlyLookup { EarlyGetProc get; bool ok; } early{early_get_proc, false};
+    HANDLE early_thread = CreateThread(nullptr, 0, [](void* context) -> DWORD {
+        auto& lookup = *static_cast<EarlyLookup*>(context);
+        HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+        lookup.ok = kernel && lookup.get && lookup.get(kernel, "GetTickCount") == GetProcAddress(kernel, "GetTickCount");
+        return 0;
+    }, &early, 0, nullptr);
+    check(early_thread != nullptr, "early lookup thread created");
+    if (early_thread) {
+        check(WaitForSingleObject(early_thread, INFINITE) == WAIT_OBJECT_0, "early lookup thread completed");
+        check(early.ok, "first host symbol lookup succeeds on a fresh thread");
+        CloseHandle(early_thread);
+    }
+
     int missing = 0;
     for (const char* n : kNames)
         if (!rt::shims::find("xgameruntime.dll", n)) {

@@ -14,6 +14,18 @@
 
 namespace {
 
+// Runs during guest CRT startup, before main: this matches the timing of the observed failing lookup.
+bool g_early_lookup = false;
+thread_local volatile unsigned g_startup_value = 17;
+struct EarlyHostLookup {
+    EarlyHostLookup() {
+        g_startup_value = g_startup_value + 1;
+        HMODULE host = GetModuleHandleW(L"kernel32.dll");
+        g_early_lookup = host && GetProcAddress(host, "GetCurrentProcessId") != nullptr;
+    }
+};
+EarlyHostLookup g_early_host_lookup;
+
 struct Options {        // InitializeApiImplEx2's fourth argument (xodus-gaming/xgameruntime-docs)
     UINT32 unknown;     // documented as always 1
     BOOL is_inline;
@@ -32,6 +44,8 @@ int fail(const char* stage, unsigned long value) {
 }  // namespace
 
 int main() {
+    if (!g_early_lookup) return fail("early CRT host lookup", GetLastError());
+    if (g_startup_value != 18) return fail("guest TLS survives early host lookup", g_startup_value);
     for (const wchar_t* dll : {L"kernel32.dll", L"kernelbase.dll"}) {
         HMODULE host = GetModuleHandleW(dll);
         if (!host) return fail("host module handle", GetLastError());
