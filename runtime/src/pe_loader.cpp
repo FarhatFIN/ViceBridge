@@ -771,15 +771,28 @@ void __cdecl on_host_thread_event(DWORD reason) {
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[rt] loader: thread attach: %s\n", e.what());
         }
+        // A callback can call an import that reads its own module's static TLS.
+        // Install all blocks before delivering any callbacks on the new thread.
+        std::array<Module*, kMaxMappedTlsModules> attached{};
         for (size_t slot = 0; slot < kMaxMappedTlsModules; ++slot) {
             Module* m = g_tls_slot_owners[slot].load();
             if (!m) continue;
             try {
                 install_thread_block(*m);
-                if (m->initialised) run_callbacks(*m, DLL_THREAD_ATTACH);
+                attached[slot] = m;
             } catch (const std::exception& e) {
                 // The thread runs on without this module's TLS; later slots still get theirs.
                 std::fprintf(stderr, "[rt] loader: thread attach, slot %zu (%s): %s\n", slot, m->name.c_str(),
+                             e.what());
+            }
+        }
+        for (size_t slot = 0; slot < attached.size(); ++slot) {
+            Module* m = attached[slot];
+            if (!m || !m->initialised) continue;
+            try {
+                run_callbacks(*m, DLL_THREAD_ATTACH);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[rt] loader: thread attach callback, slot %zu (%s): %s\n", slot, m->name.c_str(),
                              e.what());
             }
         }

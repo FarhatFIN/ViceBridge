@@ -20,6 +20,8 @@ EarlyHostLookup g_early_lookup;
 
 extern "C" __declspec(dllexport) bool tiny_gdk_dependency_lookup_ok() { return g_lookup_ok; }
 
+extern "C" __declspec(dllexport) unsigned tiny_gdk_dependency_tls_value() { return g_dependency_tls; }
+
 extern "C" __declspec(dllexport) unsigned tiny_gdk_dependency_tls_exchange(unsigned value) {
     const auto previous = g_dependency_tls;
     g_dependency_tls = value;

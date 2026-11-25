@@ -13,15 +13,22 @@
 #include <initializer_list>
 
 extern "C" __declspec(dllimport) bool tiny_gdk_dependency_lookup_ok();
+extern "C" __declspec(dllimport) unsigned tiny_gdk_dependency_tls_value();
 extern "C" __declspec(dllimport) unsigned tiny_gdk_dependency_tls_exchange(unsigned value);
 
 namespace {
 
 // Runs during guest CRT startup, before main: this matches the timing of the observed failing lookup.
 bool g_early_lookup = false;
+thread_local unsigned g_dependency_at_thread_attach = 0;
 unsigned g_dependency_initial = 0;
 unsigned g_dependency_after_lookup = 0;
 thread_local volatile unsigned g_startup_value = 17;
+void NTAPI startup_thread_callback(PVOID, DWORD reason, PVOID) {
+    if (reason == DLL_THREAD_ATTACH)
+        g_dependency_at_thread_attach = tiny_gdk_dependency_tls_value();
+}
+
 struct EarlyHostLookup {
     EarlyHostLookup() {
         // DLL process attach runs on the loader thread. Entry starts on a
@@ -53,7 +60,13 @@ int fail(const char* stage, unsigned long value) {
 
 }  // namespace
 
+#pragma section(".CRT$XLB", read)
+extern "C" __declspec(allocate(".CRT$XLB")) PIMAGE_TLS_CALLBACK g_gdk_tls_callback = startup_thread_callback;
+#pragma comment(linker, "/INCLUDE:g_gdk_tls_callback")
+
 int main() {
+    if (g_dependency_at_thread_attach != 40)
+        return fail("dependency TLS during EXE thread attach", g_dependency_at_thread_attach);
     if (!tiny_gdk_dependency_lookup_ok()) return fail("dependency CRT host lookup", 0);
     if (g_dependency_initial != 40) return fail("dependency TLS starts fresh on entry thread", g_dependency_initial);
     if (!g_early_lookup) return fail("early CRT host lookup", GetLastError());
