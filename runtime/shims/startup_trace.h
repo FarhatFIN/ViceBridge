@@ -181,6 +181,14 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 const auto op = r.ExceptionInformation[0];
                 f += ",\"access\":" + quote(op == 0 ? "read" : op == 1 ? "write" : "execute") +
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
+                if (const auto* context = info.ContextRecord;
+                    context && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) {
+                    f += ",\"registers\":{\"rax\":" + quote(hex(context->Rax)) +
+                         ",\"rcx\":" + quote(hex(context->Rcx)) +
+                         ",\"rdx\":" + quote(hex(context->Rdx)) +
+                         ",\"r8\":" + quote(hex(context->R8)) +
+                         ",\"r9\":" + quote(hex(context->R9)) + "}";
+                }
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);

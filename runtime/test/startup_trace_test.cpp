@@ -48,7 +48,8 @@ const Import kImports[2] = {{"leonida_trace_probe.dll", "TraceProbeMissing"}, {"
 constexpr uint32_t kTextRva = 0x1000;
 constexpr uint32_t kCallerBase = kTextRva + 0x200;  // caller i at kCallerBase + 0x10 * i
 constexpr uint32_t kCallRetOffset = 10;             // sub rsp,0x28 (4) + call [rip+disp] (6)
-constexpr uint32_t kFaultRva = kTextRva + 0x220;
+constexpr uint32_t kFaultEntryRva = kTextRva + 0x220;
+constexpr uint32_t kFaultRva = kFaultEntryRva + 5;  // after mov eax, imm32
 constexpr const char* kImageName = "trace_image.bin";
 constexpr const char* kDebugText = "leonida trace probe \"quoted\"";
 constexpr const char* kAnsiText = "caf\xe9 probe";  // 0xE9: 'é' in code page 1252, never valid alone in UTF-8
@@ -102,9 +103,10 @@ std::vector<uint8_t> make_image() {
         const int32_t disp = static_cast<int32_t>((kTextRva + iat_off) - return_rva(i));
         std::memcpy(fn + 6, &disp, 4);
     }
-    const uint8_t fault[] = {0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0,  // mov rax, [0]
+    const uint8_t fault[] = {0xB8, 0x34, 0x12, 0, 0,              // mov eax, 0x1234
+                             0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0,  // mov rax, [0]
                              0xC3};                               // ret
-    std::memcpy(text + (kFaultRva - kTextRva), fault, sizeof fault);
+    std::memcpy(text + (kFaultEntryRva - kTextRva), fault, sizeof fault);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     dir.VirtualAddress = kTextRva;
     dir.Size = 3 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
@@ -223,7 +225,7 @@ void test_trace(const fs::path& dir) {
         OutputDebugStringA("after_bad_dbg_print");
         OutputDebugStringW(L"wide probe \u00e9\u4e2d");  // its ANSI fallback must not be a second, lossy line
         OutputDebugStringA("after_wide_probe");
-        check(call_faulting(m.base + kFaultRva), "the access violation reached the test's handler");
+        check(call_faulting(m.base + kFaultEntryRva), "the access violation reached the test's handler");
         rt::startup_trace::event("exit", "\"code\":0");
     }
     rt::startup_trace::close();
@@ -272,6 +274,7 @@ void test_trace(const fs::path& dir) {
     check(has(e, "\"code\":\"0xc0000005\""), "exception code");
     check(has(e, "\"at\":" + mod + hex_rva(kFaultRva) + "\""), "exception address is module+RVA");
     check(has(e, "\"access\":\"read\"") && has(e, "\"address\":\"0x0\""), "access kind and faulting address");
+    check(has(e, "\"registers\":{\"rax\":\"0x1234\""), "access violation records the register value");
     check(has(e, "\"stack\":[" + mod.substr(0) + hex_rva(kFaultRva)), "stack starts at the faulting instruction");
 
     check(find_line(lines, "exit") == &lines.back(), "exit comes last");
