@@ -1,5 +1,5 @@
 // D3D12 ExecuteIndirect with a GPU count buffer and one DISPATCH argument per record.
-// The same synthetic workload runs on native WARP and on the Vulkan layer, with actual GPU readback.
+// The Vulkan layer is checked by GPU readback. Native Windows also compares the workload with WARP.
 // Set LEONIDA_VK_VALIDATION=1 to enable Vulkan core and synchronization validation.
 #include "vk_test_device.h"
 #include "shader_fixture_path.h"
@@ -33,8 +33,10 @@ void main(uint3 group : SV_GroupID) {
 }
 )";
 
+enum class DispatchMode { counted, uncounted, direct };
+
 bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count, bool gpu_update,
-         std::array<UINT, 2>& result, bool shim) {
+         std::array<UINT, 2>& result, bool shim, DispatchMode mode = DispatchMode::counted) {
     Ref<ID3D12RootSignature> root;
     D3D12_ROOT_PARAMETER param{};
     param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -110,7 +112,12 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
     list->SetComputeRootSignature(root.p);
     list->SetPipelineState(pso.p);
     list->SetComputeRootUnorderedAccessView(0, output->GetGPUVirtualAddress());
-    list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, counts.p, kCountOffset);
+    if (mode == DispatchMode::direct)
+        list->Dispatch(1, 1, 1);
+    else if (mode == DispatchMode::uncounted)
+        list->ExecuteIndirect(signature.p, 1, args.p, kArgsOffset, nullptr, 0);
+    else
+        list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, counts.p, kCountOffset);
     if (gpu_update) {
         auto to_copy = transition(counts.p, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                                   D3D12_RESOURCE_STATE_COPY_DEST);
@@ -129,7 +136,13 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
     if (FAILED(list->Close())) return false;
     ID3D12CommandList* lists[] = {list.p};
     queue->ExecuteCommandLists(1, lists);
-    if (shim && rt::d3d12::last_execute_result(queue.p) != leonida::ReplayResult::success) return false;
+    if (shim) {
+        const auto replay = rt::d3d12::last_execute_result(queue.p);
+        if (replay != leonida::ReplayResult::success) {
+            std::fprintf(stderr, "ExecuteIndirect replay rejected: %d\n", static_cast<int>(replay));
+            return false;
+        }
+    }
     if (FAILED(queue->Signal(fence.p, 1))) return false;
     const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event) return false;
@@ -177,24 +190,30 @@ std::string module_version(const wchar_t* name) {
 }  // namespace
 
 int main() {
-    using Compile = decltype(&D3DCompile);
-    const HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!compiler) return 77;
-    const auto compile = reinterpret_cast<Compile>(GetProcAddress(compiler, "D3DCompile"));
-    if (!compile) return 77;
-    Ref<ID3DBlob> native, errors;
-    if (FAILED(compile(native_shader, std::strlen(native_shader), nullptr, nullptr, nullptr,
-                       "main", "cs_5_0", 0, 0, &native.p, &errors.p)) || !native.p)
-        return 1;
-    const auto* native_bytes = static_cast<const std::uint8_t*>(native->GetBufferPointer());
-    const std::vector<std::uint8_t> native_code(native_bytes, native_bytes + native->GetBufferSize());
-    Ref<IDXGIFactory4> factory;
-    Ref<IDXGIAdapter> warp;
     Ref<ID3D12Device> host;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
-        FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
-        FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
-        return 77;
+    std::vector<std::uint8_t> native_code;
+    const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+    if (wine) {
+        std::puts("WARP comparison unavailable under Wine; checking Vulkan GPU readback.");
+    } else {
+        using Compile = decltype(&D3DCompile);
+        const HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!compiler) return 77;
+        const auto compile = reinterpret_cast<Compile>(GetProcAddress(compiler, "D3DCompile"));
+        if (!compile) return 77;
+        Ref<ID3DBlob> native, errors;
+        if (FAILED(compile(native_shader, std::strlen(native_shader), nullptr, nullptr, nullptr,
+                           "main", "cs_5_0", 0, 0, &native.p, &errors.p)) || !native.p)
+            return 1;
+        const auto* native_bytes = static_cast<const std::uint8_t*>(native->GetBufferPointer());
+        native_code.assign(native_bytes, native_bytes + native->GetBufferSize());
+        Ref<IDXGIFactory4> factory;
+        Ref<IDXGIAdapter> warp;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+            FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
+            FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
+            return 77;
+    }
 
     vktest::Device vk;
     vk.request_buffer_device_address = true;
@@ -232,20 +251,31 @@ int main() {
     // command. WARP must match it too, with one measured exception: in-box WARP 10.0.22621.5415 (Windows 11 23H2)
     // reuses the first count for the second ExecuteIndirect after the GPU copy overwrites it (0 -> 3 gives 0/0,
     // 1 -> 3 gives 2/2). That case is reported, not failed, when WARP gives exactly the stale-count result.
-    unsigned cases = 0, stale_host = 0;
+    for (auto mode : {DispatchMode::direct, DispatchMode::uncounted}) {
+        std::array<UINT, 2> result{};
+        const char* name = mode == DispatchMode::direct ? "direct" : "uncounted";
+        if (!run(layer.p, container, 1, false, result, true, mode) || result != expected(1, false)) {
+            std::fprintf(stderr, "%s dispatch control: got %u/%u, expected 1/1\n", name, result[0], result[1]);
+            return 1;
+        }
+        std::printf("%s dispatch control: 1/1\n", name);
+    }
+    unsigned cases = 0, stale_host = 0, failed_cases = 0;
     for (UINT count : {0u, 1u, 3u, 7u}) {
         for (bool update : {false, true}) {
             std::array<UINT, 2> native_result{}, layer_result{};
             const auto want = expected(count, update);
-            if (!run(host.p, native_code, count, update, native_result, false) ||
-                !run(layer.p, container, count, update, layer_result, true) || layer_result != want ||
-                (native_result != want && !(update && native_result == expected(count, update, count)))) {
-                std::fprintf(stderr, "count %u update %d: host %u/%u, layer %u/%u, expected %u/%u\n",
-                             count, int(update), native_result[0], native_result[1],
-                             layer_result[0], layer_result[1], want[0], want[1]);
-                return 1;
+            const bool layer_ok = run(layer.p, container, count, update, layer_result, true);
+            const bool host_ok = !host.p || run(host.p, native_code, count, update, native_result, false);
+            if (!layer_ok || !host_ok || layer_result != want ||
+                (host.p && native_result != want && !(update && native_result == expected(count, update, count)))) {
+                std::fprintf(stderr, "count %u update %d: host success=%d result=%u/%u, layer success=%d result=%u/%u, expected %u/%u\n",
+                             count, int(update), int(host_ok), native_result[0], native_result[1],
+                             int(layer_ok), layer_result[0], layer_result[1], want[0], want[1]);
+                ++failed_cases;
+                continue;
             }
-            if (native_result != want) {
+            if (host.p && native_result != want) {
                 std::printf("count %u update 1: host WARP build %s reused the first count (%u/%u, expected %u/%u); "
                             "the layer matches the expected result\n",
                             count, module_version(L"d3d10warp.dll").c_str(), native_result[0], native_result[1],
@@ -255,6 +285,10 @@ int main() {
             ++cases;
         }
     }
+    if (failed_cases) {
+        std::fprintf(stderr, "%u counted dispatch case(s) failed\n", failed_cases);
+        return 1;
+    }
     if (stale_host)
         std::printf("%u GPU-count-overwrite case(s) checked against the expected result only (stale WARP count)\n",
                     stale_host);
@@ -262,7 +296,8 @@ int main() {
         std::fprintf(stderr, "validation errors: %u\n", vk.validation_errors());
         return 1;
     }
-    std::printf("counted ExecuteIndirect(DISPATCH): %u native WARP / Vulkan GPU comparisons passed; "
-                "count=0,1,max,>max, nonzero offsets and GPU count overwrite, no validation errors\n", cases);
+    std::printf("counted ExecuteIndirect(DISPATCH): %u Vulkan GPU cases passed%s; "
+                "count=0,1,max,>max, nonzero offsets and GPU count overwrite, no validation errors\n", cases,
+                host.p ? " with WARP comparison" : "");
     return 0;
 }
