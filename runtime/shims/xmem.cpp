@@ -44,6 +44,11 @@ namespace {
 constexpr size_t kAlign = 64;
 constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
 
+// The first traced allocation can run during the mapped EXE's CRT startup.
+// Initialize trace state in the host before entering any mapped code.
+std::mutex g_attribute_trace_mutex;
+std::set<std::pair<std::string, uint64_t>> g_traced_attributes;
+
 std::string caller_field(const void* caller) {
     return ",\"caller\":" + rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
 }
@@ -54,11 +59,9 @@ std::string caller_field(const void* caller) {
 // real run without logging every allocation, which would fill the file. Off: one relaxed load per call.
 void note_attributes(const char* api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
-    static std::mutex mutex;
-    static std::set<std::pair<std::string, uint64_t>> seen;
     {
-        const std::lock_guard lock(mutex);
-        if (!seen.insert({api, attributes}).second) return;
+        const std::lock_guard lock(g_attribute_trace_mutex);
+        if (!g_traced_attributes.insert({api, attributes}).second) return;
     }
     std::string fields = std::string("\"api\":\"") + api +
                          "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
@@ -323,8 +326,7 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
 // 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
 // VirtualAlloc2.
-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
-    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+void* virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, DWORD protect) {
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -426,6 +428,24 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
                                                 &parameter, 1);
     }
     return VirtualAlloc(address, size, host_type, host_prot);
+}
+
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    const void* caller = _ReturnAddress();
+    note_attributes("XMemVirtualAlloc", attributes, size, caller);
+    void* const result = virtual_alloc(address, size, allocation_type, protect);
+    if (!result && rt::startup_trace::enabled()) {
+        const DWORD error = GetLastError();
+        rt::startup_trace::event(
+            "xmem_virtual_alloc_failed",
+            "\"address\":" + rt::startup_trace::quote(rt::startup_trace::hex(reinterpret_cast<uintptr_t>(address))) +
+                ",\"size\":" + std::to_string(size) + ",\"allocation_type\":" +
+                rt::startup_trace::quote(rt::startup_trace::hex(allocation_type)) + ",\"protect\":" +
+                rt::startup_trace::quote(rt::startup_trace::hex(protect)) + ",\"last_error\":" +
+                std::to_string(error) + caller_field(caller));
+        SetLastError(error);
+    }
+    return result;
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.

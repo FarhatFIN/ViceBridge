@@ -497,6 +497,11 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     void* const v = virtual_alloc ? virtual_alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x183, PAGE_READWRITE)
                                   : nullptr;
     if (v) VirtualFree(v, 0, MEM_RELEASE);
+    if (virtual_alloc) {
+        const auto invalid = virtual_alloc(nullptr, 0, MEM_RESERVE, 0x183, PAGE_READWRITE);
+        check(!invalid && GetLastError() == ERROR_INVALID_PARAMETER,
+              "traced allocation failure preserves the Win32 error");
+    }
     rt::startup_trace::close();
 
     std::ifstream in(path);
@@ -517,7 +522,10 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x5e50000\"") == 1, "XMemFree 0x5e50000 is recorded once");
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
     check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
-    check(count("\"caller\":\"") == 6, "every event names its caller");
+    check(count("\"kind\":\"xmem_virtual_alloc_failed\",\"address\":\"0x0\",\"size\":0,"
+                "\"allocation_type\":\"0x2000\",\"protect\":\"0x4\",\"last_error\":87") == 1,
+          "only the failed reservation records the request and Win32 error");
+    check(count("\"caller\":\"") == 7, "every event names its caller");
     DeleteFileW(path.c_str());
 }
 
