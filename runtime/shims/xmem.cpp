@@ -187,19 +187,16 @@ struct PlaceholderApi {
     bool available() const { return virtual_alloc2 && map_view3 && unmap_view2; }
 };
 
-const PlaceholderApi& placeholder_api() {
-    static const PlaceholderApi api = [] {
-        PlaceholderApi resolved;
-        if (const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll")) {
-            resolved.virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelbase, "VirtualAlloc2"));
-            resolved.map_view3 = reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelbase, "MapViewOfFile3"));
-            resolved.unmap_view2 =
-                reinterpret_cast<UnmapViewOfFile2Fn>(GetProcAddress(kernelbase, "UnmapViewOfFile2"));
-        }
-        return resolved;
-    }();
-    return api;
-}
+// Resolve these host exports before the mapped CRT can request its first page window.
+const PlaceholderApi g_placeholder_api = [] {
+    PlaceholderApi resolved;
+    if (const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll")) {
+        resolved.virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelbase, "VirtualAlloc2"));
+        resolved.map_view3 = reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelbase, "MapViewOfFile3"));
+        resolved.unmap_view2 = reinterpret_cast<UnmapViewOfFile2Fn>(GetProcAddress(kernelbase, "UnmapViewOfFile2"));
+    }
+    return resolved;
+}();
 
 // XMem allocation-type page bits select the guest page granularity and must not be forwarded as Win32 flags.
 constexpr DWORD kXmemLargePages = 0x20000000;  // 2 MiB pages
@@ -315,7 +312,7 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
         parameter.Pointer = &requirements;
         parameter_count = 1;
     }
-    return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+    return g_placeholder_api.virtual_alloc2(GetCurrentProcess(), address, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
                                             PAGE_NOACCESS, parameter_count ? &parameter : nullptr, parameter_count);
 }
 
@@ -352,7 +349,7 @@ void* virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, DWORD pro
     const bool new_placeholder = (host_type & MEM_RESERVE_PLACEHOLDER) != 0;
     const bool replace = (host_type & MEM_REPLACE_PLACEHOLDER) != 0;
     const bool window = page_mode != 0 && !commit && !new_placeholder;
-    if ((new_placeholder || replace || window || page_mode == kXmemLargePages) && !placeholder_api().available()) {
+    if ((new_placeholder || replace || window || page_mode == kXmemLargePages) && !g_placeholder_api.available()) {
         SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
@@ -407,7 +404,7 @@ void* virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, DWORD pro
             record_window(address, size, host_prot);
             return address;
         }
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE, host_prot,
+        return g_placeholder_api.virtual_alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE, host_prot,
                                                 nullptr, 0);
     }
     if (new_placeholder || window) {
@@ -424,7 +421,7 @@ void* virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, DWORD pro
         MEM_EXTENDED_PARAMETER parameter{};
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
+        return g_placeholder_api.virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
                                                 &parameter, 1);
     }
     return VirtualAlloc(address, size, host_type, host_prot);
@@ -452,7 +449,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 bool unmap_page(uintptr_t address) {
     const auto it = g_mapped.find(address);
     if (it == g_mapped.end()) return true;
-    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
+    if (!g_placeholder_api.unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
                                        MEM_PRESERVE_PLACEHOLDER)) {
         return false;
     }
@@ -472,7 +469,7 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
     }
     void* const target = reinterpret_cast<void*>(address);
     if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
-    void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
+    void* const view = g_placeholder_api.map_view3(it->second.section->handle, GetCurrentProcess(), target,
                                                    it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
                                                    protect, nullptr, 0);
     if (!view) return false;
@@ -588,7 +585,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    if (!placeholder_api().available()) {
+    if (!g_placeholder_api.available()) {
         SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
@@ -620,7 +617,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if (!placeholder_api().available()) {
+    if (!g_placeholder_api.available()) {
         SetLastError(ERROR_NOT_SUPPORTED);
         return FALSE;
     }
