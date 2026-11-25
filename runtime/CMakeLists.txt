@@ -541,7 +541,8 @@ if(BUILD_TESTING)
     target_compile_options(module_names_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
     target_link_options(module_names_test PRIVATE /OPT:NOREF)
     add_dependencies(module_names_test gta6rt_tls_host tiny_dll)
-    add_test(NAME module_names COMMAND module_names_test "$<TARGET_FILE:tiny_dll>")
+    add_test(NAME module_names COMMAND module_names_test "$<TARGET_FILE_NAME:tiny_dll>")
+    set_tests_properties(module_names PROPERTIES WORKING_DIRECTORY "$<TARGET_FILE_DIR:tiny_dll>")
 
     add_executable(tiny_module_names test/fixtures/tiny_module_names.cpp)
     target_compile_definitions(tiny_module_names PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -709,7 +710,9 @@ if(BUILD_TESTING)
     target_compile_definitions(tiny_game_abort_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_abort_test PRIVATE /W4 /permissive- /utf-8)
     add_dependencies(tiny_game_abort_test gta6rt tiny_game)
-    add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
+    # Relative fixture arguments work on Windows and under Wine, which cannot interpret Linux absolute paths.
+    add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE_NAME:tiny_dll>" "$<TARGET_FILE_NAME:tiny_exe>")
+    set_tests_properties(pe_loader PROPERTIES WORKING_DIRECTORY "$<TARGET_FILE_DIR:tiny_dll>")
 
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
     # base relocations (HIGHLOW included). No fixture DLL is needed; the images are written to a temporary folder.
@@ -771,8 +774,9 @@ if(BUILD_TESTING)
     target_compile_options(loader_tls_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
     add_dependencies(loader_tls_test tiny_tls tiny_tls_cb_only gta6rt_tls_host)
     add_test(NAME loader_tls
-      COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
+      COMMAND loader_tls_test "$<TARGET_FILE_NAME:tiny_tls>"
     )
+    set_tests_properties(loader_tls PROPERTIES WORKING_DIRECTORY "$<TARGET_FILE_DIR:tiny_tls>")
 
     # DisableThreadLibraryCalls from a mapped DllMain (shims/library_loader.cpp). The fixture is built without the CRT, so
     # DllMain's only work is that one call. No game files.
@@ -803,8 +807,9 @@ if(BUILD_TESTING)
     target_link_libraries(dll_thread_calls_test PRIVATE psapi)
     add_dependencies(dll_thread_calls_test dll_thread_calls)
     add_test(NAME dll_thread_calls
-      COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
+      COMMAND dll_thread_calls_test "$<TARGET_FILE_NAME:dll_thread_calls>"
     )
+    set_tests_properties(dll_thread_calls PROPERTIES WORKING_DIRECTORY "$<TARGET_FILE_DIR:dll_thread_calls>")
 
     # The host GameInput path (docs/gameinput.md): mapped code that imports GameInputCreate from GameInput.dll, with no
     # GameInput shim linked. Needs the SDK's gameinput.lib and GameInput.h to build the fixture, and a GameInput.dll on
@@ -830,7 +835,8 @@ if(BUILD_TESTING)
       target_compile_definitions(gameinput_host_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
       target_compile_options(gameinput_host_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
       add_dependencies(gameinput_host_test gameinput_host)
-      add_test(NAME gameinput_host COMMAND gameinput_host_test "$<TARGET_FILE:gameinput_host>")
+      add_test(NAME gameinput_host COMMAND gameinput_host_test "$<TARGET_FILE_NAME:gameinput_host>")
+      set_tests_properties(gameinput_host PROPERTIES WORKING_DIRECTORY "$<TARGET_FILE_DIR:gameinput_host>")
       set_tests_properties(gameinput_host PROPERTIES SKIP_RETURN_CODE 77)  # Windows cannot load GameInput.dll
     endif()
 
@@ -1143,38 +1149,42 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_atexit COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_atexit>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_atexit.cmake")
-    add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
+    # CTest starts these Windows executables in the build directory, even under Wine.
+    set(_gta6rt_test_path "$<PATH:RELATIVE_PATH,$<TARGET_FILE:gta6rt>,${CMAKE_CURRENT_BINARY_DIR}>")
+    set(_tiny_game_test_path "$<PATH:RELATIVE_PATH,$<TARGET_FILE:tiny_game>,${CMAKE_CURRENT_BINARY_DIR}>")
+    set(_tiny_game_fixed_test_path "$<PATH:RELATIVE_PATH,$<TARGET_FILE:tiny_game_fixed>,${CMAKE_CURRENT_BINARY_DIR}>")
+    add_test(NAME run_tiny_game COMMAND gta6rt --run ${_tiny_game_test_path} -- hello 42)
     add_test(NAME run_tiny_game_console_paths COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_console_paths.cmake")
     add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
-             "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
+             "${_gta6rt_test_path}" "${_tiny_game_test_path}")
     add_test(NAME run_tiny_game_abort_exit_codes COMMAND tiny_game_abort_test
-             "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
+             "${_gta6rt_test_path}" "${_tiny_game_test_path}")
     # Without relocations it can only run at 0x140000000 (base_reservation.h), so passing means it got there; the
     # game's exact exit code comes back through the relaunch.
-    add_test(NAME run_tiny_game_fixed COMMAND gta6rt --run $<TARGET_FILE:tiny_game_fixed> -- hello 42)
+    add_test(NAME run_tiny_game_fixed COMMAND gta6rt --run ${_tiny_game_fixed_test_path} -- hello 42)
     add_test(NAME run_tiny_game_fixed_exit_code COMMAND tiny_game_exit_code_test
-             "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game_fixed>")
+             "${_gta6rt_test_path}" "${_tiny_game_fixed_test_path}")
     # Two modes at once are refused before anything is mapped (#886). The stand-in game's own arguments are passed,
     # so a gta6rt that ignored the conflict would run it, print "running" and exit 0.
     foreach(modes "dry-run;run" "dry-run;init" "init;run")
       string(REPLACE ";" "_" name "${modes}")
       list(TRANSFORM modes PREPEND "--")
-      add_test(NAME gta6rt_rejects_${name} COMMAND gta6rt ${modes} $<TARGET_FILE:tiny_game> -- hello 42)
+      add_test(NAME gta6rt_rejects_${name} COMMAND gta6rt ${modes} ${_tiny_game_test_path} -- hello 42)
       set_tests_properties(gta6rt_rejects_${name} PROPERTIES
         PASS_REGULAR_EXPRESSION "usage: gta6rt"
         FAIL_REGULAR_EXPRESSION "running |module\\(s\\) mapped")
     endforeach()
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
-    add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
-    add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
+    add_test(NAME run_tiny_game_tls COMMAND gta6rt --run ${_tiny_game_test_path} -- hello 42 tls)
+    add_test(NAME run_tiny_game_eh COMMAND gta6rt --run ${_tiny_game_test_path} -- hello 42 eh)
     # BUILD-1457: the stack a game thread gets. gta6rt_stack reads SizeOfStackReserve from the built loader (nothing
     # is run); run_tiny_game_stack asks Windows, on the entry thread and on a thread created with dwStackSize 0.
     add_test(NAME gta6rt_stack COMMAND "${CMAKE_COMMAND}"
              "-DTOOL=$<TARGET_FILE:gta6rt>" "-DWANT=${GTA6RT_STACK}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
-    add_test(NAME run_tiny_game_stack COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 stack)
+    add_test(NAME run_tiny_game_stack COMMAND gta6rt --run ${_tiny_game_test_path} -- hello 42 stack)
     # GAME: is the game folder, absolute, when gta6rt is given a bare image name or `--game-dir .`.
     add_test(NAME run_tiny_game_dir COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
