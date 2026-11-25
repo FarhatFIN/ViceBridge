@@ -23,6 +23,7 @@
 #include <exception>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -180,14 +181,14 @@ int wmain(int argc, wchar_t** argv) {
                              r.error);
         }
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
-        std::exception_ptr init_failure;
+        std::optional<std::string> init_failure;
         if (init || run) {
             try {
                 loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
                 std::printf("%zu module(s) initialised\n", loader.modules().size());
-            } catch (const std::exception&) {
+            } catch (const std::exception& error) {
                 // Keep the mapped modules available for the binding report on an attach failure.
-                init_failure = std::current_exception();
+                init_failure = error.what();
             }
         }
         int unimplemented = 0, unimplemented_hresult = 0;
@@ -214,7 +215,9 @@ int wmain(int argc, wchar_t** argv) {
                     unimplemented - unimplemented_hresult);
         if (init_failure) {
             std::fflush(stdout);
-            std::rethrow_exception(init_failure);
+            std::fprintf(stderr, "error: %s\n", init_failure->c_str());
+            rt::startup_trace::event("error", "\"what\":" + rt::startup_trace::quote(*init_failure));
+            return 1;
         }
         if (!run) {
             rt::startup_trace::event("exit", "\"code\":0");

@@ -1,3 +1,5 @@
+get_filename_component(guest_dir "${GUEST}" DIRECTORY)
+get_filename_component(guest_name "${GUEST}" NAME)
 foreach(mode args no_args fail_init)
   set(args)
   if(mode STREQUAL "args")
@@ -5,15 +7,17 @@ foreach(mode args no_args fail_init)
   elseif(mode STREQUAL "fail_init")
     set(args fail-init)
   endif()
-  if(NOT mode STREQUAL "fail_init")
-    execute_process(COMMAND ${RUNNER} "${GUEST}" ${args} TIMEOUT 90
+  # This control compares against Microsoft's native UCRT startup contract.
+  if(NOT RUNNER AND NOT mode STREQUAL "fail_init")
+    execute_process(COMMAND "${GUEST}" ${args} TIMEOUT 90
       RESULT_VARIABLE native_code OUTPUT_VARIABLE native_output ERROR_VARIABLE native_error)
     if(NOT native_code STREQUAL "0" OR NOT native_output MATCHES "tiny_startup_cmdline: PASS")
       message(FATAL_ERROR "Native startup command line (${mode}) returned ${native_code}\n${native_output}\n${native_error}")
     endif()
   endif()
   execute_process(
-    COMMAND ${RUNNER} "${LOADER}" --run "${GUEST}" -- ${args}
+    COMMAND ${RUNNER} "${LOADER}" --run "${guest_name}" -- ${args}
+    WORKING_DIRECTORY "${guest_dir}"
     TIMEOUT 90
     RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE error)
   if(mode STREQUAL "fail_init")
