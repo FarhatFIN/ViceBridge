@@ -600,7 +600,14 @@ if(BUILD_TESTING)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
     # Reaches xgameruntime.dll through LoadLibraryW/GetProcAddress, as xgameruntime.lib's thunks do (no import).
+    add_library(tiny_gdk_tls SHARED test/fixtures/tiny_gdk_tls.cpp)
+    target_compile_definitions(tiny_gdk_tls PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_gdk_tls PRIVATE /W4 /permissive- /utf-8)
+    set_target_properties(tiny_gdk_tls PROPERTIES PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_executable(tiny_gdk_load test/fixtures/tiny_gdk_load.cpp)
+    target_link_libraries(tiny_gdk_load PRIVATE tiny_gdk_tls)
     target_compile_definitions(tiny_gdk_load PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_gdk_load PRIVATE /W4 /permissive- /utf-8)
     set_target_properties(tiny_gdk_load PROPERTIES

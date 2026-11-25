@@ -12,16 +12,26 @@
 #include <cwchar>
 #include <initializer_list>
 
+extern "C" __declspec(dllimport) bool tiny_gdk_dependency_lookup_ok();
+extern "C" __declspec(dllimport) unsigned tiny_gdk_dependency_tls_exchange(unsigned value);
+
 namespace {
 
 // Runs during guest CRT startup, before main: this matches the timing of the observed failing lookup.
 bool g_early_lookup = false;
+unsigned g_dependency_initial = 0;
+unsigned g_dependency_after_lookup = 0;
 thread_local volatile unsigned g_startup_value = 17;
 struct EarlyHostLookup {
     EarlyHostLookup() {
+        // DLL process attach runs on the loader thread. Entry starts on a
+        // fresh thread with its own copy of the dependency's TLS template.
+        g_dependency_initial = tiny_gdk_dependency_tls_exchange(42);
+        if (g_startup_value != 17) return;
         g_startup_value = g_startup_value + 1;
         HMODULE host = GetModuleHandleW(L"kernel32.dll");
         g_early_lookup = host && GetProcAddress(host, "GetCurrentProcessId") != nullptr;
+        g_dependency_after_lookup = tiny_gdk_dependency_tls_exchange(43);
     }
 };
 EarlyHostLookup g_early_host_lookup;
@@ -44,8 +54,13 @@ int fail(const char* stage, unsigned long value) {
 }  // namespace
 
 int main() {
+    if (!tiny_gdk_dependency_lookup_ok()) return fail("dependency CRT host lookup", 0);
+    if (g_dependency_initial != 40) return fail("dependency TLS starts fresh on entry thread", g_dependency_initial);
     if (!g_early_lookup) return fail("early CRT host lookup", GetLastError());
     if (g_startup_value != 18) return fail("guest TLS survives early host lookup", g_startup_value);
+    if (g_dependency_after_lookup != 42) return fail("dependency TLS survives EXE lookup", g_dependency_after_lookup);
+    const auto dependency_tls = tiny_gdk_dependency_tls_exchange(43);
+    if (dependency_tls != 43) return fail("dependency TLS survives EXE startup", dependency_tls);
     for (const wchar_t* dll : {L"kernel32.dll", L"kernelbase.dll"}) {
         HMODULE host = GetModuleHandleW(dll);
         if (!host) return fail("host module handle", GetLastError());
