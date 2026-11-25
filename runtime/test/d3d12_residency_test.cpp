@@ -5,9 +5,10 @@
 // few others, residency flags, a null fence, and the fence values EnqueueMakeResident signals (the value the fence
 // reaches is recorded too). Every HRESULT is recorded and the two records must be the same, step by step. A step the
 // host runtime faults on is reported and not compared. No shaders or game data. Skips (77) without a Vulkan GPU;
-// without a host D3D12 device only the layer's own record is printed. Set LEONIDA_D3D49_VERBOSE=1 to print every
+// without a native host D3D12 device the Vulkan fence checks still run. Set LEONIDA_D3D49_VERBOSE=1 to print every
 // step.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -330,9 +331,20 @@ bool run(ID3D12Device* device, bool host, Record& out) {
         const HRESULT hr = guarded(s.call, &h.o);
         out.add(s.name, std::uint64_t(std::uint32_t(hr)));
         out.add(std::string(s.name) + " (removed reason)", std::uint64_t(std::uint32_t(device->GetDeviceRemovedReason())));
-        if (s.fence_value)
-            out.add(std::string(s.name) + " (fence)",
-                    hr == HRESULT(kFaulted) ? kFaulted : settled(h.fence.p, before, s.fence_value));
+        if (s.fence_value) {
+            const UINT64 completed = hr == HRESULT(kFaulted) ? kFaulted
+                : host ? settled(h.fence.p, before, s.fence_value) : h.fence->GetCompletedValue();
+            if (!host) {
+                const UINT64 expected = s.fence_value < before ? before : s.fence_value;
+                if (hr != S_OK || completed != expected) {
+                    std::fprintf(stderr, "%s: HRESULT 0x%08lx, fence %llu, expected S_OK and %llu\n",
+                                 s.name, static_cast<unsigned long>(hr), static_cast<unsigned long long>(completed),
+                                 static_cast<unsigned long long>(expected));
+                    return false;
+                }
+            }
+            out.add(std::string(s.name) + " (fence)", completed);
+        }
     }
     return true;
 }
@@ -371,9 +383,9 @@ int main(int argc, char** argv) {
         EXPECT(run(device.p, false, ours));
 
         Ref<ID3D12Device> host;
-        host.p = create_host();
+        if (!hostwine::host_is_wine()) host.p = create_host();
         if (!host.p) {
-            std::printf("residency: no host D3D12 device to compare with; %zu steps recorded, not compared\n",
+            std::printf("residency: Vulkan fence checks passed; %zu values recorded without a native host comparison\n",
                         ours.values.size());
         } else {
             Record theirs;
