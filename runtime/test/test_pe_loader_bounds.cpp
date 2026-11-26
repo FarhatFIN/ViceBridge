@@ -721,6 +721,16 @@ void test_highlow_relocations() {
 
 // PE/COFF spec, optional header: NumberOfRvaAndSizes is "the number of data-directory entries in the remainder of
 // the optional header". Entries past it are not directories, whatever bytes they hold.
+void test_entry_page_permissions() {
+    auto image = make_base_image();
+    nt_header_of(image)->OptionalHeader.AddressOfEntryPoint = 0x180;
+    expect_loader_rejection("entry point in PE headers", image, "entry point is not executable");
+
+    image = make_base_image();
+    IMAGE_FIRST_SECTION(nt_header_of(image))->Characteristics &= ~IMAGE_SCN_MEM_EXECUTE;
+    expect_loader_rejection("entry point in non-executable section", image, "entry point is not executable");
+}
+
 void test_directory_count() {
     std::printf("\n--- NumberOfRvaAndSizes bounds the data directories ---\n");
     auto img = make_base_image(0x2000, 0x400);
@@ -948,6 +958,7 @@ int main() {
         test_boundary_exact_fits();
         test_highlow_relocations();
         test_directory_count();
+        test_entry_page_permissions();
         test_forwarder_ordinal_range();
         test_headers_and_reloc_tail_bounds();
     } catch (const std::exception& e) {

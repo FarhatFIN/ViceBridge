@@ -8,6 +8,7 @@
 
 #include "../shims/d3d12_com.h"
 #include "vulkan_loader.h"
+#include "shader_fixture_path.h"
 #include "../src/vulkan_device_filter.h"
 
 #include <cmath>
@@ -41,7 +42,7 @@ VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBits
 }
 
 bool read_spv(const char* path, std::vector<std::uint32_t>& words) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(vktest::shader_fixture_path(path), std::ios::binary | std::ios::ate);
     if (!f) return false;
     const auto sz = f.tellg();
     if (sz <= 0 || (sz % 4) != 0) return false;

@@ -182,7 +182,42 @@ std::uint8_t pattern(std::uint32_t i, std::uint8_t seed) { return std::uint8_t(i
 
 }  // namespace
 
+namespace {
+
+unsigned retirement_step = 0;
+
+VKAPI_ATTR void VKAPI_CALL record_buffer_destroy(VkDevice, VkBuffer, const VkAllocationCallbacks*) {
+    retirement_step = retirement_step == 0 ? 1 : 99;
+}
+
+VKAPI_ATTR void VKAPI_CALL record_memory_free(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {
+    retirement_step = retirement_step == 1 ? 2 : 99;
+}
+
+int check_imported_memory_retirement() {
+    DeferredDeletionQueue retired(1);
+    VulkanDeviceFunctions functions{};
+    functions.vkDestroyBuffer = &record_buffer_destroy;
+    functions.vkFreeMemory = &record_memory_free;
+    unsigned released = 0;
+    retired.push_imported_buffer(7, reinterpret_cast<VkBuffer>(1), reinterpret_cast<VkDeviceMemory>(2),
+                                 &released, [](void* storage) noexcept {
+        *static_cast<unsigned*>(storage) = retirement_step;
+        retirement_step = retirement_step == 2 ? 3 : 99;
+    });
+    retired.drain(6, VK_NULL_HANDLE, functions);
+    EXPECT(!retirement_step && !released);
+    retired.drain(7, VK_NULL_HANDLE, functions);
+    EXPECT(retirement_step == 3 && released == 2);
+    retired.drain(8, VK_NULL_HANDLE, functions);
+    EXPECT(retirement_step == 3);
+    return 0;
+}
+
+}  // namespace
+
 int main() {
+    if (check_imported_memory_retirement()) return 1;
     if (check_picker() || check_queue_slots()) return 1;
 
     vktest::Device d;

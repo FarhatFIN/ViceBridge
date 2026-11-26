@@ -3,6 +3,7 @@
 #include "../src/code_hooks.h"
 #include "../src/mods.h"
 
+#include <intrin.h>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -10,6 +11,9 @@
 namespace {
 
 int g_checks = 0, g_failures = 0;
+#ifdef VICEBRIDGE_TEST_TLS_HOST
+thread_local volatile int g_tls_probe = 42;
+#endif
 
 void check(bool ok, const char* what) {
     ++g_checks;
@@ -289,6 +293,209 @@ int main() {
           "make_result_thunk refuses null original");
     check(redirect_direct_branches(nullptr, 16, target0, thunk0) == 0,
           "redirect_direct_branches returns 0 for null begin");
+#ifdef VICEBRIDGE_TEST_TLS_HOST
+    check(g_tls_probe == 42, "the host already owns a static TLS slot");
+    HMODULE anchor = LoadLibraryW(L"gta6rt_tls_host.dll");
+    check(anchor != nullptr, "a real static TLS anchor is available");
+    if (anchor) {
+        const auto* base = reinterpret_cast<const uint8_t*>(anchor);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(
+            base + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
+        const auto slot = *reinterpret_cast<const uint32_t*>(tls->AddressOfIndex);
+        check(slot > 0 && slot <= 15, "anchor has a nonzero TLS slot encodable in disp8");
+        auto* probe = alloc_near(reinterpret_cast<const void*>(&remap_lucia), 4096);
+        check(probe != nullptr, "TLS rewrite probe allocated");
+        if (probe && slot > 0 && slot <= 15) {
+            // xor edx,edx sets ZF. cmovne rax,rdx returns null if the rewrite changed it.
+            put(probe, {0x31, 0xD2, 0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0,
+                        0x48, 0x8B, 0x00, 0x48, 0x0F, 0x45, 0xC2, 0xC3});
+            using TlsRead = void* (*)();
+            const auto read = reinterpret_cast<TlsRead>(probe);
+            const auto slots = reinterpret_cast<void* const*>(__readgsqword(0x58));
+            FlushInstructionCache(GetCurrentProcess(), probe, 19);
+            check(read() == slots[0] && slots[0] != slots[slot], "unpatched probe reads the unrelated slot zero");
+            check(redirect_tls_zero_read(probe + 2, 11, slot) != nullptr, "truncated rewrite is refused");
+            check(redirect_tls_zero_read(probe + 2, 12, UINT32_MAX) != nullptr && read() == slots[0],
+                  "unencodable slots are rejected without modifying the probe");
+            check(redirect_tls_zero_read(probe + 2, 12, slot) == nullptr, "known instruction pair is rewritten");
+            check(read() == slots[slot], "patched code reads the assigned slot and preserves ZF");
+            check(redirect_tls_zero_read(probe + 2, 12, slot) != nullptr, "mismatched bytes are refused");
+            put(probe + 32, {0x31, 0xD2, 0x65, 0x48, 0x8B, 0x0C, 0x25, 0x58, 0, 0, 0,
+                             0x48, 0x8B, 0x09, 0x48, 0x89, 0xC8, 0x48, 0x0F, 0x45, 0xC2, 0xC3});
+            FlushInstructionCache(GetCurrentProcess(), probe + 32, 22);
+            check(redirect_tls_zero_read(probe + 34, 12, slot) == nullptr, "RCX read is rewritten through a trampoline");
+            check(reinterpret_cast<TlsRead>(probe + 32)() == slots[slot], "RCX trampoline reads the assigned slot and preserves ZF");
+            put(probe + 64, {0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0,
+                             0x48, 0x8B, 0x08, 0x48, 0x89, 0xC8, 0xC3});
+            FlushInstructionCache(GetCurrentProcess(), probe + 64, 16);
+            check(redirect_tls_zero_read(probe + 64, 12, slot) == nullptr, "mixed RAX/RCX pair is rewritten");
+            check(reinterpret_cast<TlsRead>(probe + 64)() == slots[slot], "mixed-register load returns the assigned slot");
+            auto* vector_probe = probe + 128;
+            // The mixed load leaves RAX pointing at the vector. Later indexed TLS loads reuse it.
+            put(vector_probe, {0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0, 0x48, 0x8B, 0x08,
+                               0xC3});
+            FlushInstructionCache(GetCurrentProcess(), vector_probe, 13);
+            check(redirect_tls_zero_read(vector_probe, 12, slot) == nullptr &&
+                      reinterpret_cast<TlsRead>(vector_probe)() == slots,
+                  "mixed-register rewrite preserves the TLS vector in RAX");
+            auto* extended_dest = probe + 160;
+            // mov r10,[rax]; mov rax,r10. R10 is volatile in the Win64 ABI.
+            put(extended_dest, {0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0, 0x4C, 0x8B, 0x10,
+                                 0x4C, 0x89, 0xD0, 0xC3});
+            FlushInstructionCache(GetCurrentProcess(), extended_dest, 16);
+            check(redirect_tls_zero_read(extended_dest, 12, slot) == nullptr &&
+                      reinterpret_cast<TlsRead>(extended_dest)() == slots[slot],
+                  "TLS rewrite preserves the extended destination register");
+            auto* separated = probe + 192;
+            // Load a pointer from RIP+10 into RDX, then verify it survived relocation.
+            put(separated, {0x65, 0x48, 0x8B, 0x0C, 0x25, 0x58, 0, 0, 0,
+                            0x48, 0x8B, 0x15, 0x0A, 0, 0, 0,
+                            0x48, 0x8B, 0x09, 0x48, 0x89, 0xD0, 0x48, 0x31, 0xC8, 0xC3});
+            const void* marker = separated;
+            std::memcpy(separated + 26, &marker, sizeof(marker));
+            FlushInstructionCache(GetCurrentProcess(), separated, 34);
+            const auto read_rip = reinterpret_cast<uintptr_t (*)()>(separated);
+            const auto result_for = [&](uint32_t index) {
+                return reinterpret_cast<uintptr_t>(marker) ^ reinterpret_cast<uintptr_t>(slots[index]);
+            };
+            check(read_rip() == result_for(0) && redirect_tls_zero_read(separated, 18, slot) != nullptr,
+                  "truncated separated TLS pair is refused");
+            check(redirect_tls_zero_read(separated, 19, slot) == nullptr && read_rip() == result_for(slot),
+                  "relocated intervening RIP-relative instruction reads its original operand");
+            auto* with_copy = probe + 256;
+            put(with_copy, {0x31, 0xC0, 0x65, 0x48, 0x8B, 0x0C, 0x25, 0x58, 0, 0, 0, 0x48, 0x89, 0xC2,
+                            0x48, 0x8B, 0x05, 0x0A, 0, 0, 0,
+                            0x48, 0x8B, 0x09, 0x48, 0x31, 0xD0, 0x48, 0x31, 0xC8, 0xC3});
+            std::memcpy(with_copy + 31, &marker, sizeof(marker));
+            FlushInstructionCache(GetCurrentProcess(), with_copy, 39);
+            check(redirect_tls_zero_read(with_copy + 2, 21, slot) != nullptr &&
+                      redirect_tls_zero_read(with_copy + 2, 22, slot) == nullptr &&
+                      reinterpret_cast<uintptr_t (*)()>(with_copy)() == result_for(slot),
+                  "register copy plus RIP-relative load is accepted only with the full TLS sequence");
+            auto* scheduled = probe + 320;
+            // Save R12 and give the intervening stack stores space in the probe's own frame.
+            put(scheduled, {0x41, 0x54, 0x48, 0x83, 0xEC, 0x48,
+                            0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0,
+                            0x48, 0x89, 0x54, 0x24, 0x40, 0x44, 0x88, 0x4C, 0x24, 0x2F,
+                            0x48, 0x8B, 0x0D, 0x11, 0, 0, 0, 0x44, 0x0F, 0xB7, 0xE3,
+                            0x48, 0x8B, 0x00, 0x48, 0x31, 0xC8,
+                            0x48, 0x83, 0xC4, 0x48, 0x41, 0x5C, 0xC3});
+            std::memcpy(scheduled + 49, &marker, sizeof(marker));
+            FlushInstructionCache(GetCurrentProcess(), scheduled, 57);
+            check(redirect_tls_zero_read(scheduled + 6, 32, slot) != nullptr &&
+                      redirect_tls_zero_read(scheduled + 6, 33, slot) == nullptr &&
+                      reinterpret_cast<uintptr_t (*)()>(scheduled)() == result_for(slot),
+                  "scheduled TLS rewrite preserves both the slot and the RIP-relative operand");
+            auto* immediate = probe + 384;
+            put(immediate, {0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0,
+                            0xB9, 0x34, 0x12, 0, 0, 0x48, 0x8B, 0, 0x48, 0x31, 0xC8, 0xC3});
+            FlushInstructionCache(GetCurrentProcess(), immediate, 21);
+            check(redirect_tls_zero_read(immediate, 17, slot) == nullptr &&
+                      reinterpret_cast<uintptr_t (*)()>(immediate)() ==
+                          (reinterpret_cast<uintptr_t>(slots[slot]) ^ 0x1234),
+                  "TLS trampoline preserves an intervening immediate move");
+            auto* rip_address = probe + 416;
+            put(rip_address, {0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0,
+                              0x48, 0x8D, 0x0D, 0, 0, 0, 0, 0x48, 0x8B, 0, 0x48, 0x31, 0xC8, 0xC3});
+            FlushInstructionCache(GetCurrentProcess(), rip_address, 23);
+            check(redirect_tls_zero_read(rip_address, 19, slot) == nullptr &&
+                      reinterpret_cast<uintptr_t (*)()>(rip_address)() ==
+                          (reinterpret_cast<uintptr_t>(slots[slot]) ^ reinterpret_cast<uintptr_t>(rip_address + 16)),
+                  "TLS trampoline preserves an intervening RIP-relative LEA");
+            auto* extended_base = probe + 448;
+            put(extended_base, {0x65, 0x4C, 0x8B, 0x0C, 0x25, 0x58, 0, 0, 0,
+                                0x48, 0x8D, 0x05, 0, 0, 0, 0, 0x4D, 0x8B, 0x09,
+                                0x4C, 0x31, 0xC8, 0xC3});
+            extended_base[16] = 0x4C;  // R9 destination, but RCX as the memory base.
+            check(redirect_tls_zero_read(extended_base, 19, slot) != nullptr,
+                  "TLS rewrite rejects a slot read from another vector register");
+            extended_base[16] = 0x4D;
+            FlushInstructionCache(GetCurrentProcess(), extended_base, 23);
+            check(redirect_tls_zero_read(extended_base, 19, slot) == nullptr &&
+                      reinterpret_cast<uintptr_t (*)()>(extended_base)() ==
+                          (reinterpret_cast<uintptr_t>(slots[slot]) ^ reinterpret_cast<uintptr_t>(extended_base + 16)),
+                  "TLS trampoline preserves an extended vector base across a RIP-relative instruction");
+            auto* base_lea = probe + 480;
+            put(base_lea, {0x31, 0xD2, 0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0,
+                           0x48, 0x8D, 0x4A, 0x68, 0x48, 0x8B, 0, 0x48, 0x31, 0xC8, 0xC3});
+            FlushInstructionCache(GetCurrentProcess(), base_lea, 22);
+            check(redirect_tls_zero_read(base_lea + 2, 16, slot) == nullptr &&
+                      reinterpret_cast<uintptr_t (*)()>(base_lea)() ==
+                          (reinterpret_cast<uintptr_t>(slots[slot]) ^ 0x68),
+                  "TLS trampoline preserves an intervening base-relative LEA");
+            auto* trailing_copy = probe + 512;
+            put(trailing_copy, {0x65, 0x48, 0x8B, 0x14, 0x25, 0x58, 0, 0, 0,
+                                0x48, 0x8D, 0x05, 0, 0, 0, 0, 0x48, 0x89, 0xC1,
+                                0x4C, 0x8B, 0x12, 0x4C, 0x31, 0xD1, 0x48, 0x89, 0xC8, 0xC3});
+            FlushInstructionCache(GetCurrentProcess(), trailing_copy, 29);
+            check(redirect_tls_zero_read(trailing_copy, 22, slot) == nullptr &&
+                      reinterpret_cast<uintptr_t (*)()>(trailing_copy)() ==
+                          (reinterpret_cast<uintptr_t>(slots[slot]) ^ reinterpret_cast<uintptr_t>(trailing_copy + 16)),
+                  "TLS trampoline preserves a copy following the RIP-relative operation");
+            auto* one_save = probe + 576;
+            put(one_save, {0x41, 0x54, 0x48, 0x83, 0xEC, 0x48,
+                           0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0,
+                           0x44, 0x88, 0x44, 0x24, 0x2F,
+                           0x48, 0x8D, 0x0D, 0, 0, 0, 0, 0x44, 0x0F, 0xB7, 0xE7, 0x49, 0x89, 0xD2,
+                           0x48, 0x8B, 0x00, 0x48, 0x31, 0xC8,
+                           0x48, 0x83, 0xC4, 0x48, 0x41, 0x5C, 0xC3});
+            FlushInstructionCache(GetCurrentProcess(), one_save, 47);
+            check(redirect_tls_zero_read(one_save + 6, 31, slot) == nullptr &&
+                      reinterpret_cast<uintptr_t (*)()>(one_save)() ==
+                          (reinterpret_cast<uintptr_t>(slots[slot]) ^ reinterpret_cast<uintptr_t>(one_save + 27)),
+                  "scheduled TLS rewrite accepts a single stack save and alternate widening source");
+            auto* add = probe + 640;
+            put(add, {0x31, 0xD2, 0x65, 0x48, 0x8B, 0x0C, 0x25, 0x58, 0, 0, 0,
+                      0x48, 0x83, 0xC2, 0x68, 0x48, 0x8B, 0x01,
+                      0x48, 0x0F, 0x44, 0xC2, 0x48, 0x31, 0xD0, 0xC3});
+            check(redirect_tls_zero_read(add + 2, 15, slot) != nullptr,
+                  "TLS rewrite rejects a truncated ADD sequence");
+            check(redirect_tls_zero_read(add + 2, 16, slot) == nullptr &&
+                      reinterpret_cast<uintptr_t (*)()>(add)() ==
+                          (reinterpret_cast<uintptr_t>(slots[slot]) ^ 0x68),
+                  "TLS trampoline preserves intervening ADD results and flags");
+            auto* high_slot = probe + 96;
+            put(high_slot, {0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0, 0x48, 0x8B, 0x00});
+            check(redirect_tls_zero_read(high_slot, 12, 63) == nullptr, "slot 63 is accepted");
+            if (high_slot[0] == 0xE9) {
+                int32_t branch_offset = 0;
+                std::memcpy(&branch_offset, high_slot + 1, sizeof(branch_offset));
+                auto* trampoline = reinterpret_cast<uint8_t*>(reinterpret_cast<intptr_t>(high_slot + 5) + branch_offset);
+                int32_t slot_offset = 0;
+                std::memcpy(&slot_offset, trampoline + 12, sizeof(slot_offset));
+                check(trampoline[11] == 0x80 && slot_offset == 504,
+                      "slot 63 uses a 504-byte displacement");
+                VirtualFree(trampoline, 0, MEM_RELEASE);
+            } else {
+                check(false, "slot 63 uses the long-displacement trampoline");
+            }
+
+        }
+        if (probe) VirtualFree(probe, 0, MEM_RELEASE);
+        FreeLibrary(anchor);
+    }
+#endif
+    auto* writeback = mem + 1024;
+    put(writeback, {0x66, 0x41, 0x0f, 0xae, 0x31, 0x8b, 0xc1, 0xc3});
+    check(adapt_clwb_r9(writeback, 4) != nullptr && writeback[4] == 0x31,
+          "cache writeback rewrite rejects truncated instructions");
+    check(adapt_clwb_r9(writeback + 1, 7) != nullptr && writeback[4] == 0x31,
+          "cache writeback rewrite rejects other instruction boundaries");
+    int features[4]{};
+    __cpuid(features, 1);
+    if (features[3] & (1 << 19)) {
+        if (const char* error = adapt_clwb_r9(writeback, 8)) {
+            check(false, error);
+        } else {
+            alignas(64) int line = 17;
+            using WritebackProbe = int (*)(int, int, int, int*);
+            auto probe_writeback = reinterpret_cast<WritebackProbe>(writeback);
+            check(probe_writeback(23, 0, 0, &line) == 23 && line == 17,
+                  "cache writeback executes on a writable cache line and preserves the continuation");
+        }
+    }
     VirtualFree(mem, 0, MEM_RELEASE);
 
     std::printf("code_hooks_test: %d checks, %d failures\n", g_checks, g_failures);

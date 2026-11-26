@@ -23,6 +23,7 @@
 // argument buffer, the image and the indirect dispatch's output (which also shows that exactly the 3 groups the
 // first dispatch asked for ran).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -104,7 +105,7 @@ int main() {
         return 77;
     }
 
-    const std::filesystem::path root_dir = LEONIDA_TEST_M4_DIR;
+    const std::filesystem::path root_dir = vktest::shader_fixture_directory(LEONIDA_TEST_M4_DIR);
     leonida::ShaderLibrary library;
     EXPECT(library.load((root_dir / "spirv").string()));
     const auto program = [&](const char* name) { return read_file(root_dir / "fssm" / (std::string(name) + ".fssm")); };

@@ -9,7 +9,7 @@
 //   gta6rt --init <image> [--game-dir DIR] [--overlay DIR]
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
-//   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]
+//   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [--attach-on-entry] [--tls-zero-read RVA] [--clwb-rva RVA] [-- game arguments...]
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
 //       (shims/process.cpp). gta6rt prints the binding report first and returns the game's exit code.
@@ -18,6 +18,7 @@
 // (--overlay, default <game-dir>/overlay) so the package is never modified (shims/file_system.cpp).
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -53,7 +54,7 @@ int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
                  "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [--attach-on-entry] [--tls-zero-read RVA] [--clwb-rva RVA] [-- game arguments...]\n");
     return 2;
 }
 
@@ -65,8 +66,10 @@ int wmain(int argc, wchar_t** argv) {
     int archetype_lookup_arg = 0;
     uint32_t view_mode_getter_rva = 0;  // --view-mode-getter RVA: the game's view mode of a camera context
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
+    bool attach_on_entry = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
     std::wstring trace_file;
+    std::vector<uint32_t> tls_zero_reads, cache_writebacks;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--") {
@@ -76,6 +79,15 @@ int wmain(int argc, wchar_t** argv) {
         if (a == L"--dry-run") dry_run = true;
         else if (a == L"--init") init = true;
         else if (a == L"--run") run = true;
+        else if (a == L"--attach-on-entry") attach_on_entry = true;
+        else if ((a == L"--tls-zero-read" || a == L"--clwb-rva") && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const wchar_t* value = argv[++i];
+            const auto rva = std::wcstoull(value, &end, 16);
+            if (end == value || *end || !rva || rva > UINT32_MAX) return usage();
+            auto& sites = a == L"--clwb-rva" ? cache_writebacks : tls_zero_reads;
+            sites.push_back(static_cast<uint32_t>(rva));
+        }
         else if (a == L"--trace-d3d12") trace_d3d12 = true;
         else if (a == L"--trace" && i + 1 < argc) trace_file = argv[++i];
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
@@ -101,7 +113,7 @@ int wmain(int argc, wchar_t** argv) {
     }
     if (image.empty()) return usage();
     // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
-    if (dry_run + init + run != 1) return usage();
+    if (dry_run + init + run != 1 || ((attach_on_entry || !tls_zero_reads.empty() || !cache_writebacks.empty()) && !run)) return usage();
     // The console folders are fixed once, as absolute paths. A bare image name (`gta6rt --run game.exe` from the
     // game folder) has an empty parent path, which left GAME: with no root; and a relative --game-dir or --overlay
     // would follow the title's later SetCurrentDirectory. If absolute() fails the path stays as given.
@@ -157,6 +169,26 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        for (const uint32_t rva : tls_zero_reads) {
+            const char* error = "no mapped TLS block or RVA outside the image";
+            if (main_module.tls_block_size && main_module.tls_index != rt::kNoTlsIndex && rva < main_module.size)
+                error = leonida::hooks::redirect_tls_zero_read(
+                    main_module.base + rva, main_module.size - rva, main_module.tls_index);
+            if (error) {
+                std::fprintf(stderr, "error: TLS rewrite at RVA 0x%X: %s\n", rva, error);
+                return 1;
+            }
+            std::printf("TLS rewrite at RVA 0x%X uses slot %u\n", rva, main_module.tls_index);
+        }
+        for (const uint32_t rva : cache_writebacks) {
+            const char* error = rva < main_module.size
+                ? leonida::hooks::adapt_clwb_r9(main_module.base + rva, main_module.size - rva)
+                : "RVA outside the image";
+            if (error) {
+                std::fprintf(stderr, "error: CLWB rewrite at RVA 0x%X: %s\n", rva, error);
+                return 1;
+            }
+        }
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
         if (view_mode_getter_rva) {
@@ -182,7 +214,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
         std::optional<std::string> init_failure;
-        if (init || run) {
+        if (init || (run && !attach_on_entry)) {
             try {
                 loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
                 std::printf("%zu module(s) initialised\n", loader.modules().size());
@@ -243,9 +275,30 @@ int wmain(int argc, wchar_t** argv) {
             std::printf("console paths: GAME: -> %s, writes -> %s\n",
                         reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()));
         }
-        std::printf("running %s\n", main_module.name.c_str());
-        std::fflush(stdout);
-        const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);
+        struct Startup { rt::Loader& loader; rt::Module& image; } startup{loader, main_module};
+        const auto prepare = +[](void* opaque) -> bool {
+            auto& state = *static_cast<Startup*>(opaque);
+            try {
+                state.loader.initialise();
+                std::printf("%zu module(s) initialised\n", state.loader.modules().size());
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "error: %s\n", error.what());
+                rt::startup_trace::event("error", "\"what\":" + rt::startup_trace::quote(error.what()));
+                return false;
+            }
+            std::printf("running %s\n", state.image.name.c_str());
+            std::fflush(stdout);
+            return true;
+        };
+        if (!attach_on_entry) {
+            std::printf("running %s\n", main_module.name.c_str());
+            std::fflush(stdout);
+        }
+        auto entry_stack = rt::process::kEntryStackReserve;
+        if (attach_on_entry)
+            entry_stack = std::max(entry_stack, static_cast<std::size_t>(main_module.stack_reserve));
+        const int code = rt::process::run_entry(main_module.base + main_module.entry_rva, entry_stack,
+                                                attach_on_entry ? prepare : nullptr, &startup);
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
         rt::shims::report_called_unimplemented();

@@ -11,6 +11,7 @@
 #pragma once
 
 #include <windows.h>
+#include <intrin.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -219,6 +220,193 @@ inline HookResult hook_image_results(uint8_t* base, uint32_t target_rva, ResultF
     if (!fn) return HookResult{false, 0, "hook callback is null"};
     return redirect_image_calls(base, target_rva,
                                 [&](uint8_t* target) { return make_result_thunk(target, fn, target); });
+}
+
+// Rewrite an explicitly identified x64 TLS-vector read. Both instructions are
+// known. The replacement preserves flags, the continuation address, and register effects of the original pair.
+inline const char* redirect_tls_zero_read(uint8_t* site, std::size_t remaining, uint32_t slot) {
+    constexpr uint8_t original[] = {0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0,
+                                    0x48, 0x8B, 0x00};  // mov rax, gs:[58h]; mov rax, [rax]
+    if (!site || remaining < sizeof(original) || slot > INT32_MAX / 8)
+        return "invalid TLS rewrite range or slot";
+    MEMORY_BASIC_INFORMATION region{};
+    if (!VirtualQuery(site, &region, sizeof(region)) || region.State != MEM_COMMIT ||
+        (region.Protect != PAGE_EXECUTE_READ && region.Protect != PAGE_EXECUTE_READWRITE) ||
+        region.RegionSize - (reinterpret_cast<uintptr_t>(site) - reinterpret_cast<uintptr_t>(region.BaseAddress))
+            < sizeof(original))
+        return "TLS rewrite site is not readable executable memory";
+    const bool extended_base = (site[1] & 0x04) != 0;
+    const uint8_t base_low = (site[3] >> 3) & 7;
+    const uint8_t reg = base_low | (extended_base ? 8 : 0);
+    // A RIP-relative MOV can intervene, optionally preceded by a register copy.
+    constexpr std::size_t rip_load_size = 7, register_move_size = 3;
+    constexpr uint8_t stack_saves[] = {0x48, 0x89, 0x54, 0x24, 0x40, 0x44, 0x88, 0x4C, 0x24, 0x2F};
+    constexpr uint8_t widen_index[] = {0x44, 0x0F, 0xB7, 0xE3};
+    constexpr std::size_t scheduled_gap = sizeof(stack_saves) + rip_load_size + sizeof(widen_index);
+    constexpr std::size_t max_gap = scheduled_gap + register_move_size;
+    const auto readable = region.RegionSize -
+        (reinterpret_cast<uintptr_t>(site) - reinterpret_cast<uintptr_t>(region.BaseAddress));
+    const auto available = remaining < readable ? remaining : readable;
+    const uint8_t move_dest = site[11] & 7;
+    const bool register_move = available >= sizeof(original) + rip_load_size + register_move_size &&
+        site[9] == 0x48 && site[10] == 0x89 && (site[11] & 0xC0) == 0xC0 &&
+        move_dest != reg && move_dest != 4 && move_dest != 5;
+    // Recognize the scheduled variant only as a complete, straight-line sequence.
+    std::size_t stack_prefix = 0;
+    if (reg == 0 && available >= sizeof(original) + 5 + rip_load_size + sizeof(widen_index) &&
+        (std::memcmp(site + 9, stack_saves, 5) == 0 ||
+         std::memcmp(site + 9, "\x44\x88\x44\x24\x2f", 5) == 0)) {
+        stack_prefix = 5;
+        if (available >= sizeof(original) + scheduled_gap &&
+            std::memcmp(site + 14, stack_saves + 5, sizeof(stack_saves) - 5) == 0)
+            stack_prefix = sizeof(stack_saves);
+    }
+    const auto* widening = stack_prefix ? site + 9 + stack_prefix + rip_load_size : nullptr;
+    const bool scheduled = stack_prefix != 0 &&
+        std::memcmp(widening, widen_index, sizeof(widen_index) - 1) == 0 && (widening[3] & 0xC0) == 0xC0;
+    const std::size_t prefix = scheduled ? stack_prefix : register_move ? register_move_size : 0;
+    const std::size_t rip_offset = 9 + prefix;
+    const std::size_t after_rip = rip_offset + rip_load_size;
+    const bool trailing_copy = !scheduled && !register_move &&
+        available >= sizeof(original) + rip_load_size + register_move_size &&
+        site[after_rip] == 0x48 && site[after_rip + 1] == 0x89 &&
+        (site[after_rip + 2] & 0xC0) == 0xC0 &&
+        (site[after_rip + 2] & 7) != reg && (site[after_rip + 2] & 7) != 4 &&
+        (site[after_rip + 2] & 7) != 5;
+    const auto widening_end = after_rip + sizeof(widen_index);
+    const bool scheduled_copy = scheduled &&
+        available >= sizeof(original) + stack_prefix + rip_load_size + sizeof(widen_index) + register_move_size &&
+        site[widening_end] == 0x49 && site[widening_end + 1] == 0x89 &&
+        (site[widening_end + 2] & 0xC0) == 0xC0;
+    const std::size_t suffix = scheduled ? sizeof(widen_index) + (scheduled_copy ? register_move_size : 0) :
+                              trailing_copy ? register_move_size : 0;
+    const uint8_t rip_dest = (site[11 + prefix] >> 3) & 7;
+    const bool rip_load = available >= sizeof(original) + rip_load_size + prefix + suffix &&
+        site[rip_offset] == 0x48 && (site[rip_offset + 1] == 0x8B || site[rip_offset + 1] == 0x8D) &&
+        (site[rip_offset + 2] & 0xC7) == 0x05 && rip_dest != reg && rip_dest != 4 && rip_dest != 5;
+    constexpr std::size_t immediate_size = 5;
+    const auto immediate_dest = site[9] & 7;
+    const bool immediate_move = !rip_load && available >= sizeof(original) + immediate_size &&
+        (site[9] & 0xF8) == 0xB8 && immediate_dest != reg && immediate_dest != 4 && immediate_dest != 5;
+    constexpr std::size_t lea_size = 4;
+    const uint8_t lea_dest = (site[11] >> 3) & 7;
+    const bool lea = !rip_load && available >= sizeof(original) + lea_size &&
+        site[9] == 0x48 && site[10] == 0x8D && (site[11] & 0xC0) == 0x40 &&
+        (site[11] & 7) != 4 && lea_dest != reg && lea_dest != 4 && lea_dest != 5;
+    // ADD r64, imm8 can be scheduled before the dereference. Its flags and
+    // register effects are preserved by replaying it in the trampoline.
+    constexpr std::size_t add_size = 4;
+    const uint8_t add_dest = (site[11] & 7) | ((site[9] & 1) ? 8 : 0);
+    const bool add = !rip_load && available >= sizeof(original) + add_size &&
+        (site[9] == 0x48 || site[9] == 0x49) && site[10] == 0x83 &&
+        (site[11] & 0xF8) == 0xC0 && add_dest != reg && add_dest != 4 && add_dest != 5;
+    const std::size_t gap = rip_load ? rip_load_size + prefix + suffix :
+                            immediate_move ? immediate_size : lea ? lea_size : add ? add_size : 0;
+    const std::size_t span = sizeof(original) + gap;
+    const uint8_t destination = (site[11 + gap] >> 3) & 7;
+    uint8_t expected[sizeof(original)];
+    std::memcpy(expected, original, sizeof(expected));
+    expected[1] |= extended_base ? 0x04 : 0;
+    expected[3] |= base_low << 3;
+    // The second instruction must address the same vector register.
+    expected[9] |= (site[9 + gap] & 0x04) | (extended_base ? 0x01 : 0);
+    expected[11] = (destination << 3) | base_low;
+    const bool stack_or_frame_destination = !(expected[9] & 0x04) && (destination == 4 || destination == 5);
+    if (base_low == 4 || base_low == 5 || stack_or_frame_destination || std::memcmp(site, expected, 9) != 0 ||
+        std::memcmp(site + 9 + gap, expected + 9, 3) != 0)
+        return "TLS rewrite instruction does not match";
+    if (slot == 0) return nullptr;
+
+    // MOV RAX,moffs32 saves the byte needed for the second instruction's displacement.
+    uint8_t patch[sizeof(original) + max_gap] = {0x65, 0x67, 0x48, 0xA1, 0x58, 0, 0, 0,
+                       expected[9], 0x8B, static_cast<uint8_t>(0x40 | (destination << 3)), static_cast<uint8_t>(slot * 8)};
+    uint8_t* thunk = nullptr;
+    if (gap != 0 || reg != 0 || slot > INT8_MAX / 8) {
+        // Use a trampoline when the in-place form needs a longer displacement
+        // or the TLS vector is loaded into a register other than RAX.
+        thunk = alloc_near(site, 4096);
+        if (!thunk) return "cannot allocate a nearby TLS trampoline";
+        uint8_t code[21 + max_gap]{};
+        std::memcpy(code, site, span);
+        if (rip_load) {
+            int32_t old_displacement;
+            std::memcpy(&old_displacement, site + rip_offset + 3, sizeof(old_displacement));
+            const auto adjusted = static_cast<int64_t>(old_displacement) +
+                reinterpret_cast<intptr_t>(site) - reinterpret_cast<intptr_t>(thunk);
+            if (adjusted < INT32_MIN || adjusted > INT32_MAX) {
+                VirtualFree(thunk, 0, MEM_RELEASE);
+                return "RIP-relative TLS operand out of range";
+            }
+            const auto relocated = static_cast<int32_t>(adjusted);
+            std::memcpy(code + rip_offset + 3, &relocated, sizeof(relocated));
+        }
+        code[11 + gap] |= 0x80;  // [register + disp32]
+        const auto displacement = static_cast<int32_t>(slot * 8);
+        std::memcpy(code + 12 + gap, &displacement, sizeof(displacement));
+        code[16 + gap] = 0xE9;
+        const auto back = static_cast<int32_t>(reinterpret_cast<intptr_t>(site + span) -
+                                                reinterpret_cast<intptr_t>(thunk + 21 + gap));
+        std::memcpy(code + 17 + gap, &back, sizeof(back));
+        std::memcpy(thunk, code, 21 + gap);
+        DWORD ignored = 0;
+        if (!VirtualProtect(thunk, 4096, PAGE_EXECUTE_READ, &ignored) ||
+            !FlushInstructionCache(GetCurrentProcess(), thunk, 21 + gap)) {
+            VirtualFree(thunk, 0, MEM_RELEASE);
+            return "cannot finalize TLS trampoline";
+        }
+        std::memset(patch, 0x90, span);
+        patch[0] = 0xE9;
+        const auto forward = static_cast<int32_t>(reinterpret_cast<intptr_t>(thunk) -
+                                                   reinterpret_cast<intptr_t>(site + 5));
+        std::memcpy(patch + 1, &forward, sizeof(forward));
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(site, span, PAGE_EXECUTE_READWRITE, &old)) {
+        if (thunk) VirtualFree(thunk, 0, MEM_RELEASE);
+        return "cannot change TLS rewrite site protection";
+    }
+    std::memcpy(site, patch, span);
+    DWORD ignored = 0;
+    if (!VirtualProtect(site, span, old, &ignored) ||
+        !FlushInstructionCache(GetCurrentProcess(), site, span))
+        return "cannot finalize TLS rewrite";
+    return nullptr;
+}
+
+// Replace the verified CLWB [r9] form without moving the continuation.
+inline const char* adapt_clwb_r9(uint8_t* site, std::size_t remaining) {
+    constexpr uint8_t clwb[]{0x66, 0x41, 0x0f, 0xae, 0x31};
+    MEMORY_BASIC_INFORMATION region{};
+    if (!site || remaining < sizeof(clwb) || !VirtualQuery(site, &region, sizeof(region)) ||
+        region.State != MEM_COMMIT ||
+        (region.Protect != PAGE_EXECUTE_READ && region.Protect != PAGE_EXECUTE_READWRITE) ||
+        region.RegionSize - (reinterpret_cast<uintptr_t>(site) - reinterpret_cast<uintptr_t>(region.BaseAddress))
+            < sizeof(clwb) || std::memcmp(site, clwb, sizeof(clwb)) != 0)
+        return "expected executable CLWB [r9]";
+
+    int cpu[4]{};
+    __cpuid(cpu, 0);
+    bool optimized = false;
+    if (cpu[0] >= 7) {
+        __cpuidex(cpu, 7, 0);
+        if (cpu[1] & (1 << 24)) return nullptr;  // CLWB
+        optimized = (cpu[1] & (1 << 23)) != 0;  // CLFLUSHOPT
+    }
+    __cpuid(cpu, 1);
+    if (!optimized && !(cpu[3] & (1 << 19))) return "CPU has no supported cache-line flush";
+
+    // CLFLUSHOPT also writes back dirty data and invalidates the line.
+    // A NOP replaces its operand prefix on CPUs that only have CLFLUSH.
+    DWORD protect = 0;
+    if (!VirtualProtect(site, sizeof(clwb), PAGE_EXECUTE_READWRITE, &protect))
+        return "cannot change cache writeback instruction protection";
+    if (!optimized) site[0] = 0x90;
+    site[4] = 0x39;
+    DWORD ignored = 0;
+    if (!VirtualProtect(site, sizeof(clwb), protect, &ignored) ||
+        !FlushInstructionCache(GetCurrentProcess(), site, sizeof(clwb)))
+        return "cannot finalize cache writeback rewrite";
+    return nullptr;
 }
 
 }  // namespace leonida::hooks

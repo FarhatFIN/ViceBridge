@@ -11,6 +11,7 @@
 // Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test, except that
 // the NVIDIA layer's known sRGB-swapchain STORAGE check makes the run skip rather than pass or fail.
 #include "vk_test_device.h"
+#include "../shims/d3d12_trace.h"
 #include "xbox_present_readback_size.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -246,6 +247,8 @@ bool frame_matches(const Frame& frame, const Ref_plane* planes, int count, bool 
 }  // namespace
 
 int main() {
+    if (GetEnvironmentVariableW(L"VICEBRIDGE_TEST_PRESENT_TRACE", nullptr, 0))
+        rt::d3d12_trace::set_enabled(true);
     {
         // The callback's narrow exception must match the sRGB swapchain VUID, including its follow-ons, and nothing else.
         VkDebugUtilsMessengerCallbackDataEXT data{};
@@ -435,7 +438,17 @@ int main() {
         EXPECT(fill(rgba, blue_ish));
         EXPECT(next_token(token) && token == 1);
         auto plane = plane_of(rgba, token);
-        EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);
+        rt::d3d12::XboxRetailPresentPlane retail{token, 1, &rgba.resource.p};
+        rt::d3d12::XboxRetailPresentParameters options{};
+        EXPECT(xbox.PresentRetailX(0, &retail, &options) == E_INVALIDARG);
+        EXPECT(xbox.PresentRetailX(2, &retail, &options) == E_NOTIMPL);
+        options.immediate_threshold_percent = 101.0f;
+        EXPECT(xbox.PresentRetailX(1, &retail, &options) == E_INVALIDARG);
+        options.immediate_threshold_percent = 0.0f;
+        retail.reserved[0] = 1;
+        EXPECT(xbox.PresentRetailX(1, &retail, &options) == E_NOTIMPL);
+        retail.reserved[0] = 0;
+        EXPECT(xbox.PresentRetailX(1, &retail, &options) == S_OK);
         EXPECT(grab(frame));
         EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
         std::printf("1 plane, RGBA8 solid: ok (swapchain format %d)\n", int(frame.format));

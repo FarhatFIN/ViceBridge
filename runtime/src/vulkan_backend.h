@@ -418,10 +418,15 @@ public:
         framebuffer,
     };
 
+    using HostStorageReleaseFn = void (*)(void*) noexcept;
+
     struct Item {
         std::uint64_t ticket = 0;
         std::uint64_t handle = 0;  // for bindless_slot: (uint64_t(dimension) << 32) | index
         Kind kind = Kind::image_view;
+        VkBuffer imported_buffer = VK_NULL_HANDLE;
+        HostStorageReleaseFn release_host_storage = nullptr;
+        void* host_storage = nullptr;
     };
 
     using BindlessReleaseFn = void (*)(void* user, std::uint32_t dimension, std::uint32_t index);
@@ -435,6 +440,19 @@ public:
     }
 
     void push(std::uint64_t retire_ticket, Kind kind, std::uint64_t handle) {
+        enqueue(retire_ticket, kind, handle, VK_NULL_HANDLE, nullptr, nullptr);
+    }
+
+    // The imported host pointer must remain valid until Vulkan frees its memory.
+    void push_imported_buffer(std::uint64_t retire_ticket, VkBuffer buffer, VkDeviceMemory memory,
+                              void* host_storage, HostStorageReleaseFn release) {
+        enqueue(retire_ticket, Kind::device_memory, reinterpret_cast<std::uint64_t>(memory), buffer,
+                release, host_storage);
+    }
+
+private:
+    void enqueue(std::uint64_t retire_ticket, Kind kind, std::uint64_t handle,
+                 VkBuffer imported_buffer, HostStorageReleaseFn release, void* host_storage) {
         if (!handle && kind != Kind::bindless_slot) return;
         std::lock_guard lock(mutex_);
         if (count_ == pending_.size()) {
@@ -447,11 +465,12 @@ public:
             head_ = 0;
             tail_ = count_;
         }
-        pending_[tail_] = {retire_ticket, handle, kind};
+        pending_[tail_] = {retire_ticket, handle, kind, imported_buffer, release, host_storage};
         tail_ = (tail_ + 1) & (pending_.size() - 1);
         ++count_;
     }
 
+public:
     // Drains all items with ticket <= current_ticket in O(k), invoking vkDestroy* outside the lock.
     // Uses a stack-local batch vector so concurrent drain() calls from multiple queues never race.
     void drain(std::uint64_t current_ticket, VkDevice device, const VulkanDeviceFunctions& vk) {
@@ -497,7 +516,9 @@ public:
                 vk.vkDestroyBuffer(device, reinterpret_cast<VkBuffer>(item.handle), nullptr);
                 break;
             case Kind::device_memory:
+                if (item.imported_buffer) vk.vkDestroyBuffer(device, item.imported_buffer, nullptr);
                 vk.vkFreeMemory(device, reinterpret_cast<VkDeviceMemory>(item.handle), nullptr);
+                if (item.release_host_storage) item.release_host_storage(item.host_storage);
                 break;
             case Kind::acceleration_structure:
                 if (vk.vkDestroyAccelerationStructureKHR)
@@ -1429,6 +1450,13 @@ public:
         std::lock_guard lock(submit_mutex_);
         const std::uint64_t safe_ticket = submitted_ticket_.load(std::memory_order_acquire) + 1;
         deletion_queue_.push(safe_ticket, kind, raw_handle);
+    }
+
+    void defer_imported_buffer(VkBuffer buffer, VkDeviceMemory memory, void* host_storage,
+                               DeferredDeletionQueue::HostStorageReleaseFn release) {
+        std::lock_guard lock(submit_mutex_);
+        const auto safe_ticket = submitted_ticket_.load(std::memory_order_acquire) + 1;
+        deletion_queue_.push_imported_buffer(safe_ticket, buffer, memory, host_storage, release);
     }
 
     // Waits (not for the device: for the queues' timelines) until every submission up to `ticket` is done, then

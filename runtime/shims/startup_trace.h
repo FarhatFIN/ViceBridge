@@ -181,6 +181,17 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 const auto op = r.ExceptionInformation[0];
                 f += ",\"access\":" + quote(op == 0 ? "read" : op == 1 ? "write" : "execute") +
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
+                // An indirect call may have pushed a return address even when
+                // its target has no unwind metadata. Report the stack word as evidence.
+                if (op == 8 && info.ContextRecord) {
+                    DWORD64 stack_top = 0;
+                    SIZE_T bytes_read = 0;
+                    if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(info.ContextRecord->Rsp),
+                                          &stack_top, sizeof(stack_top), &bytes_read) && bytes_read == sizeof(stack_top))
+                        f += ",\"stack_top\":" + quote(where(stack_top));
+                }
+            }
+            if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_BREAKPOINT) {
                 if (const auto* context = info.ContextRecord;
                     context && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) {
                     f += ",\"registers\":{\"rax\":" + quote(hex(context->Rax)) +
@@ -190,6 +201,8 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                          ",\"r9\":" + quote(hex(context->R9)) + "}";
                 }
             }
+            if (r.ExceptionCode == EXCEPTION_BREAKPOINT)
+                f += ",\"thread\":" + std::to_string(GetCurrentThreadId());
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);

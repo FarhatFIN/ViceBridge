@@ -11,6 +11,7 @@
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "shader_fixture_path.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
@@ -55,10 +56,10 @@ int main() {
                ps_container = shader_container(ps_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_geometry_test";
     std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_GS_SPV, library / "gs_double.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_GS_SPV), library / "gs_double.spv",
                                std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs_draw\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
@@ -91,7 +92,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), rt::d3d12_xs::DeviceReturnAbi::xbox)));
         rt::d3d12::set_device_outer(inner, device.p);
 
         D3D12_ROOT_PARAMETER params[2] = {};
@@ -139,13 +140,8 @@ int main() {
         const float tints[2][3] = {{1, 0, 1}, {0, 1, 0}};  // red stays red; then green
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
-        const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        Ref<ID3D12Resource> upload, readback, target;
-        const auto upload_desc = buffer_desc(4096);
-        EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
-                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                         IID_PPV_ARGS(&upload.p))));
+        Ref<ID3D12Resource> readback, target;
         const auto readback_desc = buffer_desc(size * 256);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -161,14 +157,6 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
                                                          D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
                                                          IID_PPV_ARGS(&target.p))));
-        std::uint8_t* up = nullptr;
-        EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
-        std::memcpy(up, vertices, sizeof(vertices));
-        std::memcpy(up + 256, indices, sizeof(indices));
-        std::memcpy(up + 512, tints[0], sizeof(tints[0]));
-        std::memcpy(up + 768, tints[1], sizeof(tints[1]));
-        const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
-
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         Ref<ID3D12DescriptorHeap> rtv_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
@@ -179,39 +167,54 @@ int main() {
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
         Ref<ID3D12CommandAllocator> allocator;
-        Ref<ID3D12GraphicsCommandList> list;
+        Ref<IUnknown> list;
         Ref<ID3D12Fence> fence;
         EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
         EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
-        EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, doubled.p,
-                                                   IID_PPV_ARGS(&list.p))));
+        const IID xbox_list_iid{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+        using CreateXboxList = HRESULT(WINAPI*)(ID3D12Device*, const void*, ID3D12CommandAllocator*,
+                                                ID3D12PipelineState*, const IID*, void**);
+        const std::uint32_t list_desc[4]{};
+        EXPECT(SUCCEEDED(reinterpret_cast<CreateXboxList>(slot(device.p, 73))(
+            device.p, list_desc, allocator.p, doubled.p, &xbox_list_iid, reinterpret_cast<void**>(&list.p))));
+        using AllocateUpload = std::uint8_t*(WINAPI*)(IUnknown*, UINT64, UINT64);
+        auto* up = reinterpret_cast<AllocateUpload>(slot(list.p, 148))(list.p, 1024, 256);
+        EXPECT(up);
+        std::memcpy(up, vertices, sizeof(vertices));
+        std::memcpy(up + 256, indices, sizeof(indices));
+        std::memcpy(up + 512, tints[0], sizeof(tints[0]));
+        std::memcpy(up + 768, tints[1], sizeof(tints[1]));
+        const auto upload_va = reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(up);
+        const auto record = [&]<typename... Args>(unsigned index, Args... args) {
+            reinterpret_cast<void(WINAPI*)(IUnknown*, Args...)>(slot(list.p, index))(list.p, args...);
+        };
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
         const FLOAT blue[4] = {0, 0, 1, 1};
-        list->ClearRenderTargetView(rtv, blue, 0, nullptr);
-        list->SetGraphicsRootSignature(root.p);
-        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        record(52, rtv, blue, 0, nullptr);
+        record(34, root.p);
+        record(20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const D3D12_VERTEX_BUFFER_VIEW vbv{upload_va, sizeof(vertices), sizeof(Vertex)};
-        list->IASetVertexBuffers(0, 1, &vbv);
+        record(48, 0, 1, &vbv);
         const D3D12_INDEX_BUFFER_VIEW ibv{upload_va + 256, sizeof(indices), DXGI_FORMAT_R16_UINT};
-        list->IASetIndexBuffer(&ibv);
+        record(47, &ibv);
         const D3D12_VIEWPORT viewport{0, 0, float(size), float(size), 0, 1};
         const D3D12_RECT scissor{0, 0, LONG(size), LONG(size)};
-        list->RSSetViewports(1, &viewport);
-        list->RSSetScissorRects(1, &scissor);
-        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        record(21, 1, &viewport);
+        record(22, 1, &scissor);
+        record(50, 1, &rtv, FALSE, nullptr);
         const float top_left[2] = {0, 0}, bottom_left[2] = {0, -1};
-        list->SetGraphicsRootConstantBufferView(1, upload_va + 512);  // red
-        list->SetGraphicsRoot32BitConstants(0, 2, top_left, 0);
-        list->DrawIndexedInstanced(6, 1, 0, 0, 0);  // GS: top-left and its copy top-right
-        list->SetPipelineState(plain.p);
-        list->SetGraphicsRootConstantBufferView(1, upload_va + 768);  // green
-        list->SetGraphicsRoot32BitConstants(0, 2, bottom_left, 0);
-        list->DrawIndexedInstanced(6, 1, 0, 0, 0);  // no GS: bottom-left only
+        record(42, 1, upload_va + 512);  // red
+        record(40, 0, 2, top_left, 0);
+        record(13, 6, 1, 0, 0, 0);  // GS: top-left and its copy top-right
+        record(25, plain.p);
+        record(42, 1, upload_va + 768);  // green
+        record(40, 0, 2, bottom_left, 0);
+        record(13, 6, 1, 0, 0, 0);  // no GS: bottom-left only
 
         D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->ResourceBarrier(1, &to_copy);
+        record(26, 1, &to_copy);
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = readback.p;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -219,23 +222,29 @@ int main() {
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = target.p;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        EXPECT(list->Close() == S_OK);
-        ID3D12CommandList* lists[] = {list.p};
+        record(16, &dst, 0, 0, 0, &src, nullptr);
+        EXPECT(reinterpret_cast<HRESULT(WINAPI*)(IUnknown*)>(slot(list.p, 9))(list.p) == S_OK);
+        Ref<ID3D12Fence> gate;
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate.p))));
+        EXPECT(SUCCEEDED(queue->Wait(gate.p, 1)));
+        ID3D12CommandList* lists[] = {reinterpret_cast<ID3D12CommandList*>(list.p)};
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
+        EXPECT(fence->GetCompletedValue() == 0);
+        list.reset();
+        EXPECT(SUCCEEDED(gate->Signal(1)));
+        gate.reset();
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
 
-        for (auto* r : {&upload, &readback, &target}) r->reset();
+        for (auto* r : {&readback, &target}) r->reset();
         plain.reset();
         doubled.reset();
         root.reset();
         rtv_heap.reset();
-        list.reset();
         allocator.reset();
         queue.reset();
         fence.reset();

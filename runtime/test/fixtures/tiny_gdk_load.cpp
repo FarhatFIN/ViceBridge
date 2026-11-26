@@ -134,10 +134,18 @@ int main() {
     using Create = HRESULT(STDMETHODCALLTYPE*)(void*, UINT32, UINT32, void**);
     using Close = void(STDMETHODCALLTYPE*)(void*, void*);
     using Release = ULONG(STDMETHODCALLTYPE*)(void*);
-    void* queue = nullptr;
-    hr = reinterpret_cast<Create>(vtable[12])(obj, 0, 0, &queue);  // XTaskQueueDispatchMode::Manual twice
-    if (hr != S_OK || !queue) return fail("XThreadingImpl slot 12 (XTaskQueueCreate)", static_cast<unsigned long>(hr));
-    reinterpret_cast<Close>(vtable[17])(obj, queue);
+    const auto create = reinterpret_cast<Create>(vtable[12]);
+    const auto close = reinterpret_cast<Close>(vtable[17]);
+    // Exercise each work/completion pair under the mapped loader's CRT and TLS.
+    for (UINT32 work = 0; work < 4; ++work) {
+        for (UINT32 completion = 0; completion < 4; ++completion) {
+            void* queue = nullptr;
+            hr = create(obj, work, completion, &queue);
+            if (hr != S_OK || !queue)
+                return fail("XThreadingImpl slot 12 (XTaskQueueCreate)", static_cast<unsigned long>(hr));
+            close(obj, queue);
+        }
+    }
     reinterpret_cast<Release>(vtable[2])(obj);
 
     // A class not served (an id no runtime class has, made up for this test) is refused, with the out pointer

@@ -81,11 +81,19 @@ constexpr float kMaxAngularVelocity = 34.9066f;  // 2000 deg/s in rad/s
 constexpr float kMotionSensorRate = 250.0f;      // requested sample rate; the device clamps to what it has
 constexpr uint64_t kMotionReadingUs = 8'000;     // a motion pad streams readings at ~125 Hz so the history stays sane
 
+// Initialize timing before the guest can enter the shim on any thread.
+const LARGE_INTEGER g_counter_frequency = [] {
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    return frequency;
+}();
+
 uint64_t now_us() {
-    static const LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
-    LARGE_INTEGER c;
-    QueryPerformanceCounter(&c);
-    return static_cast<uint64_t>(c.QuadPart / freq.QuadPart * 1'000'000 + c.QuadPart % freq.QuadPart * 1'000'000 / freq.QuadPart);
+    LARGE_INTEGER counter{};
+    if (g_counter_frequency.QuadPart <= 0 || !QueryPerformanceCounter(&counter)) return 0;
+    const auto frequency = g_counter_frequency.QuadPart;
+    return static_cast<uint64_t>(counter.QuadPart / frequency * 1'000'000 +
+                                 counter.QuadPart % frequency * 1'000'000 / frequency);
 }
 
 // Release for objects the shim keeps for the process: the count never drops below one, so they are never freed.
@@ -822,11 +830,10 @@ struct State {
     std::atomic<DWORD> delivering_thread{0};  // written by the delivering thread, read unlocked by UnregisterCallback
 };
 
-// Never destroyed: the poll thread may still run while the process exits.
-State& g() {
-    static State* s = new State;
-    return *s;
-}
+// Initialize in the host CRT before mapped code can enter GameInput. The poll
+// thread may outlive CRT shutdown, so the state intentionally has no destructor.
+State* const g_state = new State;
+State& g() { return *g_state; }
 
 void queue_event(const Event& e) {
     if (e.device) e.device->AddRef();
@@ -2533,18 +2540,15 @@ private:
     std::atomic<ULONG> refs_{1};
 };
 
-GameInput& instance() {
-    static GameInput* gi = new GameInput;
-    return *gi;
-}
+// Construct the COM singleton before guest startup, for the same reason as g_state.
+GameInput* const g_instance = new GameInput;
 
 // HRESULT GameInputCreate(IGameInput** gameInput). One instance per process; each call adds a reference.
 HRESULT WINAPI GameInputCreate(IGameInput** out) {
     if (!out) return E_POINTER;
     ensure_started();
-    GameInput& gi = instance();
-    gi.AddRef();
-    *out = &gi;
+    g_instance->AddRef();
+    *out = g_instance;
     return S_OK;
 }
 

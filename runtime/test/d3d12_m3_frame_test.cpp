@@ -22,6 +22,7 @@
 // exact number of samples F made visible (rectangles are pixel-aligned, so the count is the area of F minus N).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
 // --first-pass-only isolates depth/stencil, MRT, queries and slot reuse from the descriptor-sampling second pass.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -142,7 +143,7 @@ int main(int argc, char** argv) {
         return 77;
     }
 
-    const std::filesystem::path root_dir = LEONIDA_TEST_M3_DIR;
+    const std::filesystem::path root_dir = vktest::shader_fixture_directory(LEONIDA_TEST_M3_DIR);
     leonida::ShaderLibrary library;
     EXPECT(library.load((root_dir / "spirv").string()));
     const auto program = [&](const char* name) { return read_file(root_dir / "fssm" / (std::string(name) + ".fssm")); };

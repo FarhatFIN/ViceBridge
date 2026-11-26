@@ -433,7 +433,14 @@ void check_run_time_load() {
         const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
         check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        using ReportExport = HRESULT(WINAPI*)(HRESULT, const char*);
+        const auto report_export = ::get<ReportExport>("XErrorReport");
+        check(report_export && report_export(E_INVALIDARG, "export test") == S_OK &&
+                  seen.hr == E_INVALIDARG && std::strcmp(seen.msg, "export test") == 0,
+              "XErrorReport export reaches the same callback as slot 3");
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
+        check(report_export && report_export(E_FAIL, nullptr) == S_OK && seen.hr == E_INVALIDARG,
+              "XErrorReport accepts a null message with no callback registered");
         using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
         reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None
         release(e);

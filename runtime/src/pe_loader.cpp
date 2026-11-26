@@ -472,6 +472,19 @@ void uninstall_thread_block(Module& m) {
     release_thread_slot(slot);
 }
 
+bool executable_page(const void* address) {
+    MEMORY_BASIC_INFORMATION page{};
+    if (!VirtualQuery(address, &page, sizeof(page)) || page.State != MEM_COMMIT || (page.Protect & PAGE_GUARD))
+        return false;
+    switch (page.Protect & 0xff) {
+        case PAGE_EXECUTE:
+        case PAGE_EXECUTE_READ:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY: return true;
+        default: return false;
+    }
+}
+
 // `trace`: record each callback in the startup trace. Only the Loader's own calls (process attach and detach) pass
 // true; the thread events run under the Windows loader lock and stay out of the trace.
 void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
@@ -486,6 +499,8 @@ void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
         if (!fn) break;
         auto callback =
             reinterpret_cast<PIMAGE_TLS_CALLBACK>(m.base + rva_in(m, fn, "a TLS callback"));
+        if (!executable_page(reinterpret_cast<const void*>(callback)))
+            throw std::runtime_error(m.name + ": a TLS callback is not executable");
         if (trace && startup_trace::enabled())
             startup_trace::event("tls_callback", "\"module\":" + startup_trace::quote(m.name) + ",\"at\":" +
                                                      startup_trace::quote(startup_trace::where(reinterpret_cast<uint64_t>(callback))) +
@@ -1018,6 +1033,8 @@ Module& Loader::load(const std::filesystem::path& image) {
         mapped->dynamic_load = runtime_loads_ > 0;  // before bind_imports: its dependencies are marked the same way
         bind_imports(*mapped);  // loads every bundled module m imports first, so they land in init_order_ before m
         protect_sections(*mapped);
+        if (mapped->entry_rva && !executable_page(mapped->base + mapped->entry_rva))
+            throw std::runtime_error(mapped->name + ": entry point is not executable");
         register_unwind(*mapped);
     } catch (...) {
         // A failed load, nested ones (a dependency of a run-time load) included, must not stay findable by name:
@@ -1308,6 +1325,7 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
+    m->stack_reserve = oh.SizeOfStackReserve;
     by_name_[module_key(path)] = m;
     order_.push_back(m);
 
@@ -1680,7 +1698,8 @@ void Loader::bind_imports(Module& m) {
 void Loader::protect_sections(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     DWORD old;
-    VirtualProtect(m.base, nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old);
+    if (!VirtualProtect(m.base, nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old))
+        throw std::runtime_error(m.name + ": cannot protect PE headers (" + std::to_string(GetLastError()) + ")");
     auto* sec = IMAGE_FIRST_SECTION(nt);
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
         bool x = sec->Characteristics & IMAGE_SCN_MEM_EXECUTE, w = sec->Characteristics & IMAGE_SCN_MEM_WRITE;
@@ -1688,7 +1707,9 @@ void Loader::protect_sections(Module& m) {
         uint64_t size = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
         if (sec->VirtualAddress >= m.size) continue;
         size = std::min<uint64_t>(size, m.size - sec->VirtualAddress);
-        if (size) VirtualProtect(m.base + sec->VirtualAddress, static_cast<SIZE_T>(size), prot, &old);
+        if (size && !VirtualProtect(m.base + sec->VirtualAddress, static_cast<SIZE_T>(size), prot, &old))
+            throw std::runtime_error(m.name + ": cannot protect section " + std::to_string(i) + " (" +
+                                     std::to_string(GetLastError()) + ")");
     }
     FlushInstructionCache(GetCurrentProcess(), m.base, m.size);
 }

@@ -75,6 +75,8 @@ struct VulkanDeviceInfo {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
+    PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
+    VkDeviceSize host_pointer_alignment = 0;
     VkQueue queue = VK_NULL_HANDLE;  // graphics queue used by staging and legacy single-queue callers
     std::uint32_t queue_family = 0;
     // Distinct handles from queue_family, when the creator requested more than one queue.
@@ -201,6 +203,14 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
 // tests apply them: the game's device (d3d12_xs, LEONIDA_D3D12=vulkan) passes `ignore`, so a variable left set does
 // not serialize the game's queues; it says once that it ignores them.
 enum class QueueTestSettings { apply, ignore };
+using MapPhysicalAlias = std::shared_ptr<void> (*)(const void*, std::size_t);
+HRESULT create_vulkan_xbox_placed_buffer(ID3D12Device* device, const void* address, const D3D12_RESOURCE_DESC* desc,
+                                         D3D12_RESOURCE_STATES state, REFIID iid, void** out,
+                                         MapPhysicalAlias map_alias);
+
+HRESULT create_vulkan_xbox_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC& desc,
+                                           void* address, REFIID iid, void** out, MapPhysicalAlias map_alias);
+
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out,
                                         QueueTestSettings queue_test_settings = QueueTestSettings::apply);
 

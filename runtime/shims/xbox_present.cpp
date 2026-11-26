@@ -2,6 +2,7 @@
 
 #include "../src/vulkan_present.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -99,6 +100,33 @@ HRESULT XboxPresentation::WaitFrameEventX(UINT event, DWORD timeout_ms, UINT fla
 HRESULT XboxPresentation::GetFrameStatisticsX(std::uint64_t token, UINT type_mask, UINT* count,
                                               leonida::FrameStatistic* out) {
     return from_pacer(pacer_.get_frame_statistics(token, type_mask, count, out));
+}
+
+HRESULT XboxPresentation::PresentRetailX(UINT count, const XboxRetailPresentPlane* plane,
+                                         const XboxRetailPresentParameters* params) {
+    if (!count || !plane) return E_INVALIDARG;
+    if (count != 1) return E_NOTIMPL;
+    if (!plane->resource_count || !plane->resources || !plane->resources[0]) return E_INVALIDARG;
+    const auto nonzero = [](UINT word) { return word != 0; };
+    if (plane->resource_count != 1 || plane->color_space != xbox_color_space_g22_p709 ||
+        std::any_of(plane->reserved, plane->reserved + 7, nonzero))
+        return E_NOTIMPL;
+
+    XboxPresentParameters options{};
+    if (params) {
+        const float threshold = params->immediate_threshold_percent;
+        if (!(threshold >= 0.0f && threshold <= 100.0f)) return E_INVALIDARG;
+        if (std::any_of(params->reserved, params->reserved + 7, nonzero)) return E_NOTIMPL;
+        options.ImmediateThresholdPercent = threshold;
+    }
+
+    XboxPresentPlaneParameters converted{};
+    converted.Token = plane->token;
+    converted.ResourceCount = plane->resource_count;
+    converted.ppResources = plane->resources;
+    converted.pSrcViewRects = plane->source_rect;
+    converted.pDestPlacementBase = plane->destination;
+    return PresentX(1, &converted, &options);
 }
 
 HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes,

@@ -197,6 +197,18 @@ public:
         allocator_ = allocator;
     }
 
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* object) override {
+        if (!IsEqualGUID(guid, rt::d3d12_xs::kPinXboxUpload))
+            return Child::SetPrivateDataInterface(guid, object);
+        if (!object) return E_POINTER;
+        try {
+            hold(const_cast<IUnknown*>(object));
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        return S_OK;
+    }
+
     const leonida::CommandList& commands() const { return list_; }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
     const std::vector<IUnknown*>& pinned() const { return held_; }
@@ -1188,8 +1200,8 @@ private:
 
     void hold(IUnknown* object) {
         if (!object || std::find(held_.begin(), held_.end(), object) != held_.end()) return;
-        object->AddRef();
         held_.push_back(object);
+        object->AddRef();
     }
 
     void release_held() {
@@ -1379,8 +1391,8 @@ public:
     static constexpr GUID kTag{0xe1a85d76, 0x0b3f, 0x4c29, {0xa7, 0xd4, 0x58, 0xf2, 0xc6, 0xe0, 0xb9, 0x13}};
 
     // What a held batch (queue_holds.h) keeps alive until it has run: the pipeline states and root signatures its
-    // lists name, which the application may release and Reset away as soon as ExecuteCommandLists returns. Resources
-    // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this).
+    // lists name and the internal Xbox uploads they reference. Applications still own the lifetime of ordinary
+    // resources. If a list is reset before deferred replay, this batch retains its captured references.
     static std::shared_ptr<void> pin_lists(const std::vector<const GraphicsCommandList*>& lists) {
         auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
             for (IUnknown* object : *held) object->Release();

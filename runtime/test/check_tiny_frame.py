@@ -139,6 +139,9 @@ def main():
         for problem in problems:
             print(f"FAIL: {problem}")
         return 1
+    for line in output.splitlines():
+        if "GPU copies between XMem pages through slot 133" in line or "skip XMem buffer check" in line:
+            print(line)
     print("tiny_frame under gta6rt --run on the Vulkan D3D12 device: OK")
     return 0
 

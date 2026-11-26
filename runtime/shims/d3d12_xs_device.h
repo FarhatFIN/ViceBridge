@@ -56,7 +56,16 @@ namespace rt::d3d12_xs {
 // Wraps `real` and returns the requested device interface through `out`. Takes ownership of one reference to
 // `real` on success; on failure the caller keeps its reference. Returns E_NOINTERFACE if `riid` is not a D3D12
 // device interface the PC device implements.
-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out);
+// Private command-list operation for retaining a translated upload during Vulkan replay.
+inline constexpr GUID kPinXboxUpload{0x346ef56b, 0x8dfc, 0x43b0, {0xbb, 0xa7, 0xb5, 0xab, 0x23, 0xf6, 0x25, 0x3e}};
+
+enum class DeviceReturnAbi { desktop, xbox };
+using XboxPlacedBufferFn = HRESULT (*)(ID3D12Device*, const void*, const D3D12_RESOURCE_DESC*,
+                                         D3D12_RESOURCE_STATES, REFIID, void**);
+using XboxPlacedHeapFn = HRESULT (*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC&, void*, REFIID, void**);
+HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out,
+                            DeviceReturnAbi return_abi = DeviceReturnAbi::desktop,
+                            XboxPlacedBufferFn place_buffer = nullptr, XboxPlacedHeapFn place_heap = nullptr);
 
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);

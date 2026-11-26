@@ -20,6 +20,7 @@
 // required).
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "shader_fixture_path.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
@@ -403,7 +404,7 @@ int main(int argc, char** argv) {
     const auto program = fssm_program({0x43530003, 0xbf810000});
     const auto library = std::filesystem::temp_directory_path() / "leonida_bindless_churn_test";
     std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SET0_SAMPLE_SPV, library / "cs_set0_sample.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SET0_SAMPLE_SPV), library / "cs_set0_sample.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);

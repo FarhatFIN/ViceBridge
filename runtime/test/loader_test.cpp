@@ -805,6 +805,23 @@ void test_process_detach() {
     g_use_fls = false;
 }
 
+void test_non_executable_tls_callback() {
+    auto image = make_init_image();
+    auto* callback = reinterpret_cast<uint64_t*>(image.data() + 0x290);
+    *callback = nt_of(image)->OptionalHeader.ImageBase + 0x180;  // read-only PE headers
+    rt::Loader loader(g_dir);
+    auto& loaded = loader.load(write_image(image));
+    try {
+        loader.initialise();
+        failed("TLS callback in PE headers", "the loader did not reject the callback");
+    } catch (const std::runtime_error& e) {
+        if (std::string(e.what()).find("TLS callback is not executable") != std::string::npos && !loaded.initialised)
+            pass("TLS callback in PE headers is rejected before invocation");
+        else
+            failed("TLS callback in PE headers", e.what());
+    }
+}
+
 void test_process_detach_invalid_tls() {
     reset_notifications();
     g_use_fls = true;
@@ -1343,6 +1360,7 @@ int main() {
         test_initialise();
         test_initialise_rejects();
         test_process_detach();
+        test_non_executable_tls_callback();
         test_process_detach_invalid_tls();
         test_process_detach_without_entry();
         test_attach_reserved();

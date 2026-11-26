@@ -339,6 +339,8 @@ bool mapped_image_base(uint64_t address, uint64_t& base) {
 }
 
 std::string module_offset(uint64_t address) {
+    // GetModuleHandleExW can treat a null address as the main image.
+    if (!address) return "0x0";
     char b[48];
     std::string module;
     uint32_t rva = 0;

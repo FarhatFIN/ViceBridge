@@ -36,6 +36,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace rt::shims {
 bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
@@ -134,6 +135,19 @@ template <auto F, class R, class... A> struct Method<F, R (*)(A...) noexcept> {
     static R STDMETHODCALLTYPE call(void*, A... a) noexcept { return F(a...); }
 };
 
+HRESULT WINAPI create_task_queue(XTaskQueueDispatchMode work, XTaskQueueDispatchMode completion,
+                                 XTaskQueueHandle* queue) {
+    if (rt::startup_trace::enabled())
+        rt::startup_trace::event("task_queue_create",
+            "\"work_mode\":" + std::to_string(static_cast<uint32_t>(work)) +
+            ",\"completion_mode\":" + std::to_string(static_cast<uint32_t>(completion)));
+    const HRESULT result = XTaskQueueCreate(work, completion, queue);
+    if (rt::startup_trace::enabled())
+        rt::startup_trace::event("task_queue_created",
+            "\"result\":" + rt::startup_trace::quote(rt::startup_trace::hex(static_cast<uint32_t>(result))));
+    return result;
+}
+
 constexpr GUID kIUnknown = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 
 // The runtime's objects are process-wide singletons: AddRef/Release count but never free.
@@ -207,7 +221,7 @@ const void* const kThreadingVtable[] = {
     XM(XAsyncSchedule),                     // 9
     XM(XAsyncComplete),                     // 10
     XM(XAsyncGetResult),                    // 11
-    XM(XTaskQueueCreate),                   // 12
+    XM(create_task_queue),                  // 12
     XM(XTaskQueueCreateComposite),          // 13
     XM(XTaskQueueGetPort),                  // 14
     XM(XTaskQueueDuplicateHandle),          // 15
@@ -239,7 +253,7 @@ std::atomic<void*> g_error_context{nullptr};
 std::mutex g_error_mutex{};   // guards g_error_callback + g_error_context as one consistent pair
 
 // HRESULT XErrorReport(HRESULT, const char*) (xgameruntime-docs' XErrorReport.md): S_OK once reported.
-HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
+HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) {
     static std::atomic<int> s_logged{0};
     if (s_logged.fetch_add(1) < 64)
         std::fprintf(stderr, "[rt] xgameruntime: XErrorReport(0x%08lx, %s)\n", static_cast<unsigned long>(hr),
@@ -247,6 +261,9 @@ HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     std::lock_guard<std::mutex> lock(g_error_mutex);
     if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
     return S_OK;
+}
+HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
+    return XErrorReport(hr, message);
 }
 void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* context) {
     std::lock_guard<std::mutex> lock(g_error_mutex);
@@ -1324,6 +1341,7 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
+    XGR(XErrorReport),
     // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
     {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
@@ -1341,7 +1359,7 @@ SHIM_TABLE(xgameruntime,
     XGR(XPackageGetMountPath),
     XGR(XPackageIsPackagedProcess),
     // XTaskQueue (third_party/xtaskqueue)
-    XGR(XTaskQueueCreate),
+    {"xgameruntime.dll", "XTaskQueueCreate", reinterpret_cast<void*>(&create_task_queue)},
     XGR(XTaskQueueCreateComposite),
     XGR(XTaskQueueGetPort),
     XGR(XTaskQueueDuplicateHandle),

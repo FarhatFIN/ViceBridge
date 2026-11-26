@@ -40,7 +40,7 @@ class ResumeShardsTest(unittest.TestCase):
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
 
-            def wait(self):
+            def poll(self):
                 if self.i in crash:
                     return 1
                 with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:

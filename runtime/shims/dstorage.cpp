@@ -54,16 +54,15 @@ namespace {
 // ---- Logging ------------------------------------------------------------------------------------------------------
 
 // Process-lifetime state is allocated once and never freed: a worker thread may still run while statics are destroyed
-// at exit.
-std::mutex& log_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+// at exit. Initialize it with the host CRT to avoid guest-thread CRT initialization guards.
+auto* const g_log_mutex = new std::mutex;
+std::mutex& log_mutex() { return *g_log_mutex; }
+
+auto* const g_logged = new std::set<std::string>;
 
 void log_once(const std::string& key, const std::string& line) {
-    static auto* seen = new std::set<std::string>;
     std::lock_guard lock(log_mutex());
-    if (!seen->insert(key).second) return;
+    if (!g_logged->insert(key).second) return;
     std::fprintf(stderr, "[rt] dstorage: %s\n", line.c_str());
 }
 
@@ -182,10 +181,8 @@ private:
     std::vector<std::pair<GUID, Kind>> learned_;
 };
 
-IidPolicy& iid_policy() {
-    static auto* p = new IidPolicy;
-    return *p;
-}
+auto* const g_iid_policy = new IidPolicy;
+IidPolicy& iid_policy() { return *g_iid_policy; }
 
 // A bad argument to a factory or queue method, logged once per method and kind: a wrong vtable guess for the console
 // interfaces would show up here first, as arguments that make no sense for the method.
@@ -204,10 +201,8 @@ struct Stats {
     uint32_t live_queues = 0;  // all priorities; SetStagingBufferSize is refused while queues or files exist
 };
 
-Stats& stats() {
-    static auto* s = new Stats;
-    return *s;
-}
+auto* const g_stats = new Stats;
+Stats& stats() { return *g_stats; }
 
 DSTORAGE_PRIORITY_STATS& priority_stats(DSTORAGE_STATS& s, DSTORAGE_PRIORITY p) {
     switch (p) {
@@ -228,19 +223,13 @@ void count_error() {
 // A request names its file and a status entry its array by pointer. Only objects this shim made and that are still
 // alive are used; anything else is an error in the request, never a call through a stranger's vtable.
 
-std::mutex& live_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+auto* const g_live_mutex = new std::mutex;
+std::mutex& live_mutex() { return *g_live_mutex; }
 // One set per kind, so a status array passed as a file (or the other way round) is not found.
-std::unordered_set<const void*>& live_files() {
-    static auto* s = new std::unordered_set<const void*>;
-    return *s;
-}
-std::unordered_set<const void*>& live_status_arrays() {
-    static auto* s = new std::unordered_set<const void*>;
-    return *s;
-}
+auto* const g_live_files = new std::unordered_set<const void*>;
+std::unordered_set<const void*>& live_files() { return *g_live_files; }
+auto* const g_live_status_arrays = new std::unordered_set<const void*>;
+std::unordered_set<const void*>& live_status_arrays() { return *g_live_status_arrays; }
 
 // AddRef only if the count has not reached zero (an object being released is not revived).
 bool add_ref_if_live(std::atomic<ULONG>& refs) {
@@ -1174,10 +1163,8 @@ private:
     uint32_t staging_size_ = 32u << 20;  // under stats().mutex
 };
 
-Factory& factory() {
-    static auto* f = new Factory;
-    return *f;
-}
+auto* const g_factory = new Factory;
+Factory& factory() { return *g_factory; }
 
 HRESULT WINAPI dstorage_get_factory(REFIID riid, void** ppv) {
     if (!ppv) return bad_call("DStorageGetFactory", E_POINTER, "null ppv");

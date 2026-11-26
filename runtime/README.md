@@ -364,13 +364,14 @@ from the ANSI code page.
 | `map` | a module is mapped, bound and protected | `module`, `base`, `size`, `relocated` |
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
+| `entry` | immediately before the guest entry point on its execution thread | `at` (module+RVA), `thread` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
-| `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA) |
+| `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA); virtual allocations also report requested and returned bases, allocation flags and protection |
 | `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
 | `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
-| `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
+| `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames), `stack_top` (raw stack word for an execute fault when readable) |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |
 
 Every line also has `seq` and `t` (seconds since the trace opened). Addresses are `module+0xRVA` for mapped images,
@@ -553,3 +554,16 @@ a saved-state byte and require the expected guest errors. This fixture renders o
 
 Local memory/audio and DirectStorage import integration, including unsupported hardware operations:
 [local_imports15.md](../docs/local_imports15.md).
+
+`gta6rt --run <exe> --attach-on-entry` is an experimental startup mode. It runs DLL process
+attach and EXE process TLS callbacks on the thread that will enter the EXE. Its stack reserve
+is the greater of 8 MiB and the EXE header’s requested reserve. Use it to compare
+startup behavior with a synthetic fixture. The default mode attaches modules on the loader
+thread and enters the EXE on a separate thread.
+
+For an image with a verified hard-coded slot-zero access, pass `--tls-zero-read RVA` to
+`--run` once per confirmed instruction site. The RVA is hexadecimal. The loader checks
+the TLS-vector load and the slot read in executable memory, including supported intervening
+instructions. It redirects the read to the mapped EXE's TLS slot. An adjacent RAX load uses
+an in-place rewrite when the displacement fits. Other supported sequences use a nearby
+trampoline that preserves register effects and relocates any RIP-relative operand.

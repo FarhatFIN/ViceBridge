@@ -34,6 +34,7 @@ struct Module {
     uint64_t preferred_base = 0;
     uint32_t size = 0;
     uint32_t entry_rva = 0;
+    uint64_t stack_reserve = 0;  // SizeOfStackReserve from the PE optional header
     bool relocated = false;
     bool initialised = false;
 

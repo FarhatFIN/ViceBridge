@@ -242,7 +242,7 @@ int main() {
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
                                 library / "fspx" / "cs_c_state1.spv"));
     {
-        std::ifstream in(LEONIDA_TEST_CS_SPV, std::ios::binary);
+        std::ifstream in(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), std::ios::binary);
         std::vector<char> words((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         EXPECT(words.size() > 12);
         words[8] ^= 0x5a;  // word 2: the generator

@@ -26,14 +26,18 @@
 // The control also keeps one unbounded SRV table bound and selects its two entries by a root constant.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
 #include "vk_test_device.h"
+#include "shader_fixture_path.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
+#include "../src/gfx10_tiling.h"
+#include "../src/gfx10_compact.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -92,7 +96,13 @@ Texel linear_clamp(UINT col, UINT row) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool tiled_input = argc == 2 && std::strcmp(argv[1], "--tiled") == 0;
+    const bool compact_input = argc == 2 && std::strcmp(argv[1], "--compact") == 0;
+    if (argc != 1 && !tiled_input && !compact_input) {
+        std::fprintf(stderr, "usage: d3d12_m2_textured_test [--tiled|--compact]\n");
+        return 2;
+    }
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
@@ -102,7 +112,7 @@ int main() {
         return 77;
     }
 
-    const std::filesystem::path root_dir = LEONIDA_TEST_M2_DIR;
+    const auto root_dir = vktest::shader_fixture_directory(LEONIDA_TEST_M2_DIR);
     const auto vs_program = read_file(root_dir / "fssm" / "vs_m2.fssm");
     const auto ps_program = read_file(root_dir / "fssm" / "ps_m2.fssm");
     EXPECT(vs_program.size() >= 4 && ps_program.size() >= 4);
@@ -251,12 +261,56 @@ int main() {
         EXPECT(footprint.Footprint.RowPitch == 256 && footprint.Footprint.RowPitch * texture_size <= b_offset);
         std::uint8_t* up = nullptr;
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
+        if (tiled_input || compact_input) std::memset(up, 0, static_cast<std::size_t>(index_offset));
         for (UINT y = 0; y < texture_size; ++y)
             for (UINT x = 0; x < texture_size; ++x) {
                 const Texel a = gradient(x, y), b = reflected(x, y);
                 std::memcpy(up + y * footprint.Footprint.RowPitch + x * 4, a.data(), 4);
                 std::memcpy(up + b_offset + y * footprint.Footprint.RowPitch + x * 4, b.data(), 4);
             }
+        if (tiled_input || compact_input) {
+            // Exercise standalone or compact-tail conversion before the real GPU upload, without tile XOR.
+            const leonida::gfx10::TileMode modes[] = {leonida::gfx10::TileMode::sw_4kb_s,
+                                                     leonida::gfx10::TileMode::sw_64kb_d};
+            for (unsigned i = 0; i < 2; ++i) {
+                leonida::gfx10::TiledSurface2D surface;
+                EXPECT(leonida::gfx10::TiledSurface2D::make(modes[i], 4, texture_size, texture_size, surface));
+                auto destination = std::span(reinterpret_cast<std::byte*>(up + (i ? b_offset : 0)),
+                                             static_cast<std::size_t>(b_offset));
+                const std::vector<std::byte> original(destination.begin(), destination.end());
+                leonida::gfx10::CompactSurface2D compact;
+                if (compact_input)
+                    EXPECT(leonida::gfx10::CompactSurface2D::make(modes[i], texture_size, texture_size, 4, 4, 1, compact));
+                std::vector<std::byte> tiled(compact_input ? compact.tiled_size() : surface.tiled_size(), std::byte{0xcc});
+                if (compact_input) {
+                    const auto* mip = compact.mip(0);
+                    EXPECT(mip && compact.first_tail() == 0);
+                    for (UINT y = 0; y < texture_size; ++y)
+                        for (UINT x = 0; x < texture_size; ++x) {
+                            std::size_t offset = 0;
+                            EXPECT(mip->surface.element_offset(x + mip->origin_x, y + mip->origin_y, offset));
+                            std::memcpy(tiled.data() + mip->offset + offset,
+                                        original.data() + y * footprint.Footprint.RowPitch + x * 4, 4);
+                        }
+                } else {
+                    EXPECT(surface.tile(original, tiled, footprint.Footprint.RowPitch));
+                }
+                auto detile = [&](std::span<const std::byte> source) {
+                    return compact_input ? compact.detile(0, source, destination, footprint.Footprint.RowPitch)
+                                         : surface.detile(source, destination, footprint.Footprint.RowPitch);
+                };
+                std::fill(destination.begin(), destination.end(), std::byte{0xab});
+                EXPECT(!detile(std::span(tiled).first(tiled.size() - 1)));
+                EXPECT(std::all_of(destination.begin(), destination.end(),
+                                   [](std::byte b) { return b == std::byte{0xab}; }));
+                EXPECT(detile(tiled));
+                for (UINT y = 0; y < texture_size; ++y)
+                    EXPECT(std::memcmp(destination.data() + y * footprint.Footprint.RowPitch,
+                                       original.data() + y * footprint.Footprint.RowPitch, texture_size * 4) == 0);
+            }
+            std::puts(compact_input ? "compact input: 4K S and 64K D RGBA8 tail origins converted for GPU upload"
+                                    : "native tiled input: 4K S and 64K D standalone RGBA8 levels converted for GPU upload");
+        }
         const std::uint16_t indices[6] = {0, 1, 2, 2, 1, 3};
         std::memcpy(up + index_offset, indices, sizeof(indices));
 
@@ -529,6 +583,18 @@ int main() {
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
+    }
+    // Opt-in artifact of verified GPU pixels, never an application-generated reference image.
+    if (const char* path = std::getenv("VICEBRIDGE_TEST_CAPTURE_PPM")) {
+        std::ofstream capture(path, std::ios::binary | std::ios::trunc);
+        EXPECT(capture.is_open());
+        capture << "P6\n" << target_size << ' ' << target_size << "\n255\n";
+        for (UINT y = 0; y < target_size; ++y)
+            for (UINT x = 0; x < target_size; ++x)
+                capture.write(reinterpret_cast<const char*>(pixels.data() + y * target_pitch + x * 4), 3);
+        capture.close();
+        EXPECT(!capture.fail());
+        std::printf("verified GPU readback captured to %s\n", path);
     }
     std::printf("M2: a textured quad through descriptor heaps, SRVs, a POINT sampler and two root descriptor tables "
                 "matched all %u pixels (error 0, and the sampler control: WRAP left, CLAMP right, %u pixels differ from the plain pass): translated PS sampled a T#/S# found in the hash table (%u image "

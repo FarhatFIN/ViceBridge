@@ -1,6 +1,6 @@
 // A stand-in game executable for `gta6rt --run`: what a real title does in its first second, run through the
 // loader instead of the Windows one. Test code, not game content. Run as
-//   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh] [stack] [game-file] [exit-code] [abort-mode]
+//   gta6rt --run tiny_game.exe -- hello 42 [tls] [fls] [eh] [stack] [game-file] [exit-code] [abort-mode]
 // It checks its arguments, a static initializer, the heap, a file round trip, a second thread, and the
 // xgameruntime.dll imports (answered by the shim registry: the stub DLL it links against would fail them), then
 // calls exit() with 0 (42 with `exit-code`) when everything held. Two checks are opt-in, by argument (CTest's
@@ -53,6 +53,54 @@ bool has_arg(int argc, char** argv, const char* name) {
 }
 
 thread_local int t_counter = 5;
+
+struct FiberProbe {
+    void* parent;
+    DWORD slot;
+    bool starts_empty = false;
+    bool writes_value = false;
+    bool shares_thread_tls = false;
+    unsigned destroyed = 0;
+};
+
+void NTAPI fiber_cleanup(void* value) {
+    ++static_cast<FiberProbe*>(value)->destroyed;
+}
+
+VOID WINAPI probe_fiber(void* opaque) {
+    auto& probe = *static_cast<FiberProbe*>(opaque);
+    probe.starts_empty = FlsGetValue(probe.slot) == nullptr;
+    probe.writes_value = FlsSetValue(probe.slot, &probe) && FlsGetValue(probe.slot) == &probe;
+    probe.shares_thread_tls = t_counter == 5;
+    t_counter = 6;
+    SwitchToFiber(probe.parent);
+}
+
+void test_fls() {
+    void* parent = ConvertThreadToFiber(nullptr);
+    check(parent != nullptr, "convert mapped entry thread to a fiber");
+    if (!parent) return;
+    const DWORD slot = FlsAlloc(fiber_cleanup);
+    check(slot != FLS_OUT_OF_INDEXES, "allocate a guest FLS index with a guest cleanup callback");
+    if (slot != FLS_OUT_OF_INDEXES) {
+        FiberProbe child_probe{parent, slot}, parent_probe{parent, slot};
+        check(FlsSetValue(slot, &parent_probe) != FALSE, "set parent fiber value");
+        void* child = CreateFiber(0, probe_fiber, &child_probe);
+        check(child != nullptr, "create a second fiber");
+        if (child) {
+            SwitchToFiber(child);
+            check(child_probe.starts_empty && child_probe.writes_value, "each fiber has its own FLS value");
+            check(FlsGetValue(slot) == &parent_probe, "switch back restores the parent FLS value");
+            check(child_probe.shares_thread_tls && t_counter == 6, "static TLS stays shared across fibers");
+            DeleteFiber(child);
+            check(child_probe.destroyed == 1 && parent_probe.destroyed == 0, "deleting child runs only its mapped FLS callback");
+        }
+        check(FlsFree(slot) && parent_probe.destroyed == 1, "freeing FLS invokes the live parent callback");
+        t_counter = 5;
+    }
+    check(ConvertFiberToThread() != FALSE, "restore mapped entry thread after fiber test");
+}
+
 
 void abort_exit_handler(int) {
     std::_Exit(43);  // a handler that ends the run itself, as a real title's crash reporter may
@@ -118,6 +166,7 @@ int main(int argc, char** argv) {
     } else {
         std::printf("tiny_game: SKIP thread_local (argument tls)\n");
     }
+    if (has_arg(argc, argv, "fls")) test_fls();
     if (has_arg(argc, argv, "eh")) {
         bool caught = false;
         try {
@@ -129,7 +178,8 @@ int main(int argc, char** argv) {
     } else {
         std::printf("tiny_game: SKIP C++ exception (argument eh)\n");
     }
-    if (has_arg(argc, argv, "stack")) {
+    const bool large_entry_stack = has_arg(argc, argv, "stack-12m");
+    if (large_entry_stack || has_arg(argc, argv, "stack")) {
         // Windows gives a thread created with no size the reserve in the process's PE header, which is gta6rt's,
         // not this image's. The entry thread gets its size from run_entry.
         const size_t want = size_t{8} << 20;
@@ -141,7 +191,8 @@ int main(int argc, char** argv) {
         }
         std::printf("tiny_game: stack reserve: entry thread %zu bytes, CreateThread with dwStackSize 0 %zu bytes\n",
                     entry, created);
-        check(entry >= want, "the entry thread has at least 8 MB of stack");
+        check(entry >= (large_entry_stack ? size_t{12} << 20 : want),
+              "the entry thread has the requested stack reserve");
         check(created >= want, "a thread created with dwStackSize 0 has at least 8 MB of stack");
     } else {
         std::printf("tiny_game: SKIP stack reserve (argument stack)\n");

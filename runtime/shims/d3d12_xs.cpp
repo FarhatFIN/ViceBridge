@@ -17,6 +17,7 @@
 
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"
+#include "xmem_pages.h"
 #endif
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
@@ -171,7 +172,17 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                          static_cast<unsigned long>(vhr));
             return result(method, vhr);
         }
-        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
+        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out, rt::d3d12_xs::DeviceReturnAbi::xbox,
+            [](ID3D12Device* device, const void* address, const D3D12_RESOURCE_DESC* desc,
+               D3D12_RESOURCE_STATES state, REFIID iid, void** resource) {
+                return rt::d3d12::create_vulkan_xbox_placed_buffer(device, address, desc, state, iid, resource,
+                                                                   rt::xmem::map_physical_alias);
+            },
+            [](ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC& desc, void* address,
+               REFIID iid, void** heap) {
+                return rt::d3d12::create_vulkan_xbox_descriptor_heap(device, desc, address, iid, heap,
+                                                                     rt::xmem::map_physical_alias);
+            });
         if (FAILED(vhr)) {
             vulkan->Release();
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
@@ -199,7 +210,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         return result(method, FAILED(hr) ? hr : E_FAIL);
     }
 
-    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
+    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out, rt::d3d12_xs::DeviceReturnAbi::xbox);
     if (FAILED(hr)) {
         // create_device_proxy keeps the caller's reference on failure.
         real->Release();

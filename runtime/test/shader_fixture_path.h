@@ -5,6 +5,13 @@
 #include <filesystem>
 
 namespace vktest {
+inline std::filesystem::path shader_fixture_directory(const std::filesystem::path& compiled_path) {
+    // Prefer an artifact-relative path: Linux absolute paths are not Windows paths under Wine.
+    const auto packaged = std::filesystem::path("generated") / compiled_path.filename();
+    if (std::filesystem::is_directory(packaged)) return packaged;
+    return compiled_path;
+}
+
 inline std::filesystem::path shader_fixture_path(const std::filesystem::path& compiled_path) {
     if (std::filesystem::is_regular_file(compiled_path)) return compiled_path;
     const auto packaged = std::filesystem::path("generated") / compiled_path.filename();

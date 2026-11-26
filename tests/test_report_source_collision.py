@@ -16,11 +16,10 @@ import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR", os.path.join(ROOT, "tools"))
-SENTINEL = b"SYNTHETIC-SOURCE-DO-NOT-OVERWRITE\n" * 4
 
 
 def make_bink():
-    return SENTINEL
+    return struct.pack("<4s10I", b"KB2a", 40, 1, 0, 1, 16, 16, 30, 1, 0, 1) + bytes(4)
 
 
 def make_rpf(payload, head_size=0x40):

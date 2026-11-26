@@ -23,11 +23,12 @@ namespace {
 // Native DXGI accepts up to 40 queued frames on a waitable swapchain.
 constexpr UINT max_waitable_frame_latency = 40;
 
+std::mutex g_stub_mutex;
+std::set<std::string> g_stub_methods;
+
 void stub(const char* method) {
-    static std::mutex mutex;
-    static std::set<std::string> seen;
-    std::lock_guard lock(mutex);
-    if (seen.insert(method).second) std::fprintf(stderr, "[rt] dxgi: unimplemented %s\n", method);
+    std::lock_guard lock(g_stub_mutex);
+    if (g_stub_methods.insert(method).second) std::fprintf(stderr, "[rt] dxgi: unimplemented %s\n", method);
 }
 
 // IDXGIObject private data, shared by the factory, adapter and swapchain. SetPrivateData keeps a copy of the bytes;
@@ -636,15 +637,16 @@ struct ReservationState {
 
 // Video-memory reservations are scoped per physical adapter in the process (matching native DXGI,
 // where separate IDXGIAdapter3 handles opened for the same LUID observe each other's reservations).
+std::mutex g_reservation_mutex;
+std::map<std::tuple<std::uint32_t, std::int32_t, std::uintptr_t>, std::shared_ptr<ReservationState>> g_reservations;
+
 std::shared_ptr<ReservationState> adapter_reservation_state(LUID luid, VkPhysicalDevice physical) {
-    static std::mutex mutex;
-    static std::map<std::tuple<std::uint32_t, std::int32_t, std::uintptr_t>, std::shared_ptr<ReservationState>> table;
     const bool has_luid = (luid.LowPart != 0 || luid.HighPart != 0);
     const auto key =
         has_luid ? std::make_tuple(std::uint32_t(luid.LowPart), std::int32_t(luid.HighPart), std::uintptr_t(0))
                  : std::make_tuple(std::uint32_t(0), std::int32_t(0), reinterpret_cast<std::uintptr_t>(physical));
-    std::lock_guard lock(mutex);
-    auto& entry = table[key];
+    std::lock_guard lock(g_reservation_mutex);
+    auto& entry = g_reservations[key];
     if (!entry) entry = std::make_shared<ReservationState>();
     return entry;
 }

@@ -18,6 +18,7 @@
 // Synthetic data only; no game files. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "host_wine.h"
+#include "shader_fixture_path.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/uav_clear.h"
@@ -190,7 +191,8 @@ bool run_uav_clear_sequence(ID3D12Device* dev, bool vulkan_device, const std::ve
 
 #ifdef LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV
 bool read_spirv(const char* path, std::vector<std::uint32_t>& out) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const auto fixture = vktest::shader_fixture_path(path);
+    std::ifstream file(fixture, std::ios::binary | std::ios::ate);
     if (!file) return false;
     const auto size = file.tellg();
     if (size <= 0 || size % 4 != 0) return false;

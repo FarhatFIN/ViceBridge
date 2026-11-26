@@ -22,6 +22,7 @@
 #include "../shims/d3d12_com.h"
 #if defined(LEONIDA_DEPTH_EDGE_VS_SPV)
 #include "d3d12_test_shaders.h"
+#include "shader_fixture_path.h"
 #include "../src/shader_library.h"
 
 #include <d3dcompiler.h>
@@ -366,7 +367,7 @@ int main() {
         edge_container = d3d12test::shader_container(program);
         const auto library = std::filesystem::temp_directory_path() / "leonida_depth_resolve_test";
         std::filesystem::create_directories(library);
-        std::filesystem::copy_file(LEONIDA_DEPTH_EDGE_VS_SPV, library / "vs.spv",
+        std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_DEPTH_EDGE_VS_SPV), library / "vs.spv",
                                    std::filesystem::copy_options::overwrite_existing);
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(program)

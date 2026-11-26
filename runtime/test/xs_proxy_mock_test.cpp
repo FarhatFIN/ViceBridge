@@ -87,6 +87,7 @@ struct Mock {
     bool allocator_tag;      // allocator: answers kLeonidaCommandAllocatorTag; device: the allocators it makes do
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
+    D3D12_COMMAND_QUEUE_DESC last_queue_desc;
     Mock* last_child;        // device: the object its last creation or open made
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
@@ -145,7 +146,8 @@ bool mock_has(const Mock* m, REFIID iid) {
         case Kind::resource: return IsEqualIID(iid, __uuidof(ID3D12Resource));
         case Kind::command_list:
             return IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
-                   IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList));
+                   IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList)) ||
+                   IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList7));
         case Kind::allocator:
             return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator)) ||
                    (m->allocator_tag && IsEqualIID(iid, xs::kLeonidaCommandAllocatorTag));
@@ -182,11 +184,22 @@ void copy_array(Mock* m, unsigned slot, std::uint64_t objects, std::uint64_t cou
 }
 
 // `words` are the call's first five words (a1..a5), copied into the thunk's own frame.
+alignas(256) std::uint8_t g_mock_upload[256];
+constexpr std::uint64_t kMockUploadGpu = 0x123450000;
+
 std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
     if (m->kind == Kind::device) {
         switch (slot) {
-            case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
+            case 26: {
+                auto* properties = reinterpret_cast<D3D12_HEAP_PROPERTIES*>(a1);
+                *properties = {static_cast<D3D12_HEAP_TYPE>(a3), D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                               D3D12_MEMORY_POOL_L0, static_cast<UINT>(a2), 1};
+                return a1;
+            }
+            case 8:
+                if (a1) m->last_queue_desc = *reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1);
+                return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
@@ -201,6 +214,17 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         }
         return S_OK;
     }
+    if (m->kind == Kind::resource && slot == 8) {
+        *reinterpret_cast<void**>(a3) = g_mock_upload;
+        return S_OK;
+    }
+    if (m->kind == Kind::resource && slot == 11) return kMockUploadGpu;
+    if (m->kind == Kind::command_list && slot == 43 && a1)
+        m->array[slot][0] = reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(a1)->BufferLocation;
+    if (m->kind == Kind::command_list && slot == 44 && a2 && a3)
+        m->array[slot][0] = reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(a3)->BufferLocation;
+    if ((m->kind == Kind::queue && slot == 10) || (m->kind == Kind::command_list && slot == 28))
+        copy_array(m, slot, a2, a1);
     if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
     return S_OK;
 }
@@ -246,6 +270,14 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
     return mock_query(child, riid, out);
 }
 
+HRESULT WINAPI mock_create_upload(Mock* self, const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS,
+                                  const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                  const D3D12_CLEAR_VALUE*, const IID* iid, void** out) {
+    if (heap->Type != D3D12_HEAP_TYPE_UPLOAD || desc->Width > sizeof(g_mock_upload)) return E_INVALIDARG;
+    return mock_create(self, Kind::resource, reinterpret_cast<std::uint64_t>(iid),
+                       reinterpret_cast<std::uint64_t>(out));
+}
+
 template <std::size_t... I>
 void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&mock_slot<static_cast<unsigned>(I)>)), ...);
@@ -256,6 +288,7 @@ void** mock_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
+        table[27] = reinterpret_cast<void*>(&mock_create_upload);
         return true;
     }();
     (void)filled;
@@ -293,14 +326,15 @@ const IID kDevice1Iid = __uuidof(ID3D12Device1);
 const D3D12_COMMAND_QUEUE_DESC kQueueDesc{};
 
 // A device proxy over a new mock device. The proxy takes the mock's one reference.
-void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true) {
+void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true,
+                  xs::DeviceReturnAbi return_abi = xs::DeviceReturnAbi::desktop) {
     mock = new_mock(Kind::device);
     mock->device_level = level;
     mock->fence1 = fence1;
     mock->allocator_tag = allocator_tag;
     mock->refs = 1;
     void* device = nullptr;
-    if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device)))
+    if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device, return_abi)))
         return nullptr;
     return device;
 }
@@ -317,6 +351,124 @@ void* make_fence(void* device, const IID& iid = kFenceIid) {
 
 unsigned long release(void* object) {
     return static_cast<unsigned long>(raw(object, 2));
+}
+
+int check_xbox_device_abi() {
+    Mock* mock = nullptr;
+    auto* desktop = static_cast<ID3D12Device*>(make_device(mock, 0, true));
+    EXPECT(desktop);
+    const auto desktop_result = desktop->GetCustomHeapProperties(3, D3D12_HEAP_TYPE_READBACK);
+    EXPECT(desktop_result.Type == D3D12_HEAP_TYPE_READBACK && desktop_result.CreationNodeMask == 3);
+    desktop->Release();
+
+    auto* xbox = make_device(mock, 0, true, true, xs::DeviceReturnAbi::xbox);
+    EXPECT(xs::is_device_proxy(xbox));
+    using XboxGetCustomHeapProperties = D3D12_HEAP_PROPERTIES*(WINAPI*)(
+        D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
+    const auto query = reinterpret_cast<XboxGetCustomHeapProperties>((*static_cast<void***>(xbox))[26]);
+    D3D12_HEAP_PROPERTIES xbox_result{};
+    EXPECT(query(&xbox_result, xbox, 3, D3D12_HEAP_TYPE_READBACK) == &xbox_result);
+    EXPECT(std::memcmp(&desktop_result, &xbox_result, sizeof(xbox_result)) == 0);
+    EXPECT(hr_of(raw(xbox, 133)) == E_NOTIMPL);
+    EXPECT(xs::device_slot_first_call_seen(133));
+    const std::uint32_t queue_words[] = {D3D12_COMMAND_LIST_TYPE_COMPUTE, 100, 0x101, 0xff};
+    void* queue = nullptr;
+    EXPECT(hr_of(raw(xbox, 48, word(queue_words), word(&kQueueIid), word(&queue))) == S_OK);
+    EXPECT(xs::is_queue_proxy(queue) && mock->last_queue_desc.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+           mock->last_queue_desc.Priority == 100 && mock->last_queue_desc.Flags == D3D12_COMMAND_QUEUE_FLAG_NONE &&
+           mock->last_queue_desc.NodeMask == 0);
+    release(queue);
+    mock->create_null = true;
+    mock->create_result = E_INVALIDARG;
+    queue = xbox;
+    EXPECT(hr_of(raw(xbox, 48, word(queue_words), word(&kQueueIid), word(&queue))) == E_INVALIDARG && !queue);
+    mock->create_null = false;
+    mock->create_result = S_OK;
+    const IID xbox_list_iid{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(xbox, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    const std::uint32_t list_desc[4]{};
+    void* list = nullptr;
+    EXPECT(hr_of(raw(xbox, 73, word(list_desc), word(allocator), 0, word(&xbox_list_iid), word(&list))) == S_OK);
+    EXPECT(list);
+    Mock* real_list = mock->last_child;
+    queue = make_queue(xbox);
+    EXPECT(queue);
+    Mock* real_queue = mock->last_child;
+    void* lists[] = {list};
+    void* heaps[] = {allocator};
+    raw(list, 32, 1, word(heaps));
+    raw(list, 33, 0);
+    raw(list, 37, 2, 17, 3);
+    EXPECT(real_list->calls[28] == 1 && real_list->array[28][0] == word(allocator));
+    EXPECT(real_list->calls[29] == 1 && real_list->calls[33] == 1);
+    EXPECT(real_list->args[33][0] == 2 && real_list->args[33][1] == 17 && real_list->args[33][2] == 3);
+    for (unsigned slot = 41; slot <= 46; ++slot) {
+        constexpr std::uint64_t address = 0x100020000ULL;
+        raw(list, slot, 3, address);
+        EXPECT(real_list->calls[slot - 4] == 1 && real_list->args[slot - 4][0] == 3 &&
+               real_list->args[slot - 4][1] == address);
+    }
+    const D3D12_INDEX_BUFFER_VIEW index_view{0x10000, 32, DXGI_FORMAT_R16_UINT};
+    const D3D12_VERTEX_BUFFER_VIEW vertex_view{0x20000, 64, 16};
+    raw(list, 47, word(&index_view));
+    raw(list, 48, 2, 1, word(&vertex_view));
+    EXPECT(real_list->calls[43] == 1 && real_list->array[43][0] == index_view.BufferLocation);
+    EXPECT(real_list->calls[44] == 1 && real_list->args[44][0] == 2 &&
+           real_list->args[44][1] == 1 && real_list->array[44][0] == vertex_view.BufferLocation);
+    const D3D12_RESOURCE_BARRIER aliasing{D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                                         D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
+    raw(list, 26, 1, word(&aliasing));
+    EXPECT(real_list->calls[26] == 1 && real_list->args[26][0] == 1 &&
+           real_list->args[26][1] == word(&aliasing));
+    raw(list, 19, word(real_list), 2, word(mock), 3, DXGI_FORMAT_R8G8B8A8_UNORM);
+    EXPECT(real_list->calls[19] == 1 && real_list->args[19][0] == word(real_list) &&
+           static_cast<UINT>(real_list->args[19][1]) == 2 && real_list->args[19][2] == word(mock) &&
+           static_cast<UINT>(real_list->args[19][3]) == 3 &&
+           static_cast<DXGI_FORMAT>(real_list->args[19][4]) == DXGI_FORMAT_R8G8B8A8_UNORM);
+    const auto upload_address = raw(list, 148, 64, 16);
+    EXPECT(upload_address == word(g_mock_upload));
+    Mock* real_upload = mock->last_child;
+    EXPECT(real_upload->kind == Kind::resource);
+    raw(list, 43, 4, upload_address + 16);
+    EXPECT(real_list->calls[5] == 1 && real_list->args[5][0] == word(&xs::kPinXboxUpload) &&
+           real_list->args[5][1] == word(real_upload));
+    EXPECT(real_list->args[39][1] == kMockUploadGpu + 16);
+    raw(list, 43, 4, upload_address + 64);
+    EXPECT(real_list->args[39][1] == upload_address + 64);
+    const D3D12_VERTEX_BUFFER_VIEW upload_view{upload_address + 16, 32, 16};
+    raw(list, 48, 2, 1, word(&upload_view));
+    EXPECT(real_list->array[44][0] == kMockUploadGpu + 16 && upload_view.BufferLocation == upload_address + 16);
+    D3D12_GLOBAL_BARRIER barrier{D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                                 D3D12_BARRIER_ACCESS_COPY_DEST, D3D12_BARRIER_ACCESS_SHADER_RESOURCE};
+    D3D12_BARRIER_GROUP group{D3D12_BARRIER_TYPE_GLOBAL, 1};
+    group.pGlobalBarriers = &barrier;
+    raw(list, 146, word(&group));
+    EXPECT(real_list->calls[80] == 1 && real_list->args[80][0] == 1 && real_list->args[80][1] == word(&group));
+    EXPECT(raw(list, 132, 0x700000, 0, 0, 0xffffffffff00ULL) == 0);
+    EXPECT(raw(list, 131, 0xc3c0, 0x80020000, 0, 0xffffffffff00ULL) == 0);
+    raw(queue, 10, 1, word(lists));
+    EXPECT(real_queue->calls[10] == 0);
+    EXPECT(hr_of(raw(list, 9)) == S_OK);
+    raw(queue, 10, 1, word(lists));
+    EXPECT(real_queue->calls[10] == 1 && real_queue->array[10][0] == word(real_list));
+    EXPECT(hr_of(raw(list, 10, word(allocator))) == S_OK);
+    const D3D12_VERTEX_BUFFER_VIEW past_upload{upload_address + 48, 32, 16};
+    EXPECT(hr_of(raw(list, 48, 0, 1, word(&past_upload))) == E_INVALIDARG);
+    EXPECT(hr_of(raw(list, 48, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, 1, word(&vertex_view))) == E_INVALIDARG);
+    EXPECT(real_list->calls[44] == 2);
+    EXPECT(hr_of(raw(list, 26, 1, 0)) == E_INVALIDARG && real_list->calls[26] == 1);
+    EXPECT(hr_of(raw(list, 132)) == E_NOTIMPL);
+    EXPECT(hr_of(raw(list, 9)) == E_NOTIMPL);
+    raw(queue, 10, 1, word(lists));
+    EXPECT(real_queue->calls[10] == 1);
+    release(queue);
+    EXPECT(release(list) == 0);
+    EXPECT(real_upload->calls[9] == 1 && real_upload->refs == 0);
+    release(allocator);
+    release(xbox);
+    return 0;
 }
 
 // ---- 1. Device interface levels ----
@@ -813,7 +965,9 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
-        EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 1);  // not an Xbox slot: forwarded
+        // Slot 70 is the Xbox address-only SRV call. With no placement callback and a null destination it is a
+        // harmless void call, and it must not reach the unrelated desktop vtable entry at the same index.
+        EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 0);
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: environment slot overrides %s\n", g_label,
@@ -947,7 +1101,7 @@ int main(int argc, char** argv) {
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
+    if (check_tail(true) || check_xbox_device_abi() || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

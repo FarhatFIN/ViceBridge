@@ -107,6 +107,10 @@ std::vector<uint8_t> make_image() {
                              0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0,  // mov rax, [0]
                              0xC3};                               // ret
     std::memcpy(text + (kFaultEntryRva - kTextRva), fault, sizeof fault);
+    const uint8_t breakpoint[] = {0xB8, 0x78, 0x56, 0, 0, 0xCC, 0xC3};
+    std::memcpy(text + 0x240, breakpoint, sizeof breakpoint);
+    const uint8_t null_call[] = {0x31, 0xC0, 0xFF, 0xD0, 0xC3};
+    std::memcpy(text + 0x250, null_call, sizeof null_call);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     dir.VirtualAddress = kTextRva;
     dir.Size = 3 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
@@ -115,10 +119,15 @@ std::vector<uint8_t> make_image() {
 
 fs::path test_dir() {
     const char* env = std::getenv("LEONIDA_TEST_DIR");
-    fs::path dir = (env && *env ? fs::path(env) : fs::temp_directory_path()) /
-                   ("leonida_startup_trace_" + std::to_string(GetCurrentProcessId()));
-    fs::create_directories(dir);
-    return dir;
+    const fs::path root = env && *env ? fs::path(env) : fs::temp_directory_path();
+    fs::create_directories(root);
+    const auto prefix = "leonida_startup_trace_" + std::to_string(GetCurrentProcessId()) + "_";
+    // Wine can reuse a PID after restarting its server. Reserve a fresh directory even after a failed run.
+    for (unsigned attempt = 0; attempt < 1024; ++attempt) {
+        const auto directory = root / (prefix + std::to_string(attempt));
+        if (fs::create_directory(directory)) return directory;
+    }
+    throw std::runtime_error("cannot reserve a startup trace fixture directory");
 }
 
 fs::path write_file(const fs::path& p, const std::vector<uint8_t>& bytes) {
@@ -131,10 +140,10 @@ fs::path write_file(const fs::path& p, const std::vector<uint8_t>& bytes) {
 using VoidFn = uint64_t(__cdecl*)(const char*);
 
 // Separate function: __try cannot share a frame with objects that have destructors.
-bool call_faulting(void* fn) {
+bool call_faulting(void* fn, DWORD expected = EXCEPTION_ACCESS_VIOLATION) {
     __try {
         reinterpret_cast<uint64_t(__cdecl*)()>(fn)();
-    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+    } __except (GetExceptionCode() == expected ? EXCEPTION_EXECUTE_HANDLER
                                                                   : EXCEPTION_CONTINUE_SEARCH) {
         return true;
     }
@@ -226,6 +235,8 @@ void test_trace(const fs::path& dir) {
         OutputDebugStringW(L"wide probe \u00e9\u4e2d");  // its ANSI fallback must not be a second, lossy line
         OutputDebugStringA("after_wide_probe");
         check(call_faulting(m.base + kFaultEntryRva), "the access violation reached the test's handler");
+        check(call_faulting(m.base + kTextRva + 0x240, EXCEPTION_BREAKPOINT), "breakpoint reaches the test handler");
+        check(call_faulting(m.base + kTextRva + 0x250), "the null call reaches the test handler");
         rt::startup_trace::event("exit", "\"code\":0");
     }
     rt::startup_trace::close();
@@ -277,6 +288,19 @@ void test_trace(const fs::path& dir) {
     check(has(e, "\"registers\":{\"rax\":\"0x1234\""), "access violation records the register value");
     check(has(e, "\"stack\":[" + mod.substr(0) + hex_rva(kFaultRva)), "stack starts at the faulting instruction");
 
+    bool breakpoint_context = false;
+    for (const auto& line : lines)
+        breakpoint_context |= line.find("\"code\":\"0x80000003\"") != std::string::npos &&
+                              line.find("\"rax\":\"0x5678\"") != std::string::npos &&
+                              line.find("\"thread\":" + std::to_string(GetCurrentThreadId())) != std::string::npos;
+    check(breakpoint_context, "breakpoint records registers and the execution thread");
+
+    bool null_target = false;
+    for (const auto& line : lines)
+        null_target |= line.find("\"at\":\"0x0\",\"access\":\"execute\",\"address\":\"0x0\"") != std::string::npos &&
+                       line.find("\"stack_top\":" + mod + hex_rva(kTextRva + 0x254) + "\"") != std::string::npos;
+    check(null_target, "a null execute fault records the stack word from the guest call site");
+
     check(find_line(lines, "exit") == &lines.back(), "exit comes last");
 }
 
@@ -285,6 +309,9 @@ void test_trace(const fs::path& dir) {
 int wmain() {
     try {
         const fs::path dir = test_dir();
+        const fs::path second_dir = test_dir();
+        check(second_dir != dir, "two trace fixtures in one process reserve distinct directories");
+        if (second_dir != dir) fs::remove(second_dir);
         test_disabled_is_silent();
         test_existing_file_is_kept(dir);
         test_trace(dir);

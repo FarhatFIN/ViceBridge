@@ -35,15 +35,11 @@ namespace {
 
 // Intentionally immortal: mapped-DLL DLL_PROCESS_DETACH and earlier atexit handlers can call GetProcAddress or
 // FreeLibrary on pseudo-handles during process teardown, after normal statics would have been destroyed.
-std::mutex& loader_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
-
-std::deque<Pseudo>& pseudos() {   // a deque never moves its elements, so handed-out handles stay valid
-    static auto* d = new std::deque<Pseudo>;
-    return *d;
-}
+// Initialize in the host CRT, before a guest call can reach a local static guard.
+auto* const g_loader_mutex = new std::mutex;
+auto* const g_pseudos = new std::deque<Pseudo>;  // stable addresses for handed-out handles
+auto* const g_missing_export_mutex = new std::mutex;
+auto* const g_missing_exports = new std::set<std::string>;
 
 std::string lower_ascii(std::string s) {
     for (auto& c : s)
@@ -109,19 +105,19 @@ std::string host_module_name(HMODULE module) {
 HMODULE owned_handle(const std::string& path) {
     const std::string dll = module_name(path);
     if (dll.empty() || !owns_dll(dll)) return nullptr;
-    std::lock_guard lock(loader_mutex());
-    for (auto& p : pseudos())
+    std::lock_guard lock(*g_loader_mutex);
+    for (auto& p : *g_pseudos)
         if (p.dll == dll) return reinterpret_cast<HMODULE>(&p);
-    pseudos().push_back(Pseudo{});
-    pseudos().back().dll = dll;
+    g_pseudos->push_back(Pseudo{});
+    g_pseudos->back().dll = dll;
     std::fprintf(stderr, "[rt] loader: %s is served by the shims (run-time load)\n", dll.c_str());
-    return reinterpret_cast<HMODULE>(&pseudos().back());
+    return reinterpret_cast<HMODULE>(&g_pseudos->back());
 }
 
 // The owned module a handle names, or nullptr for a host module.
 const Pseudo* pseudo(HMODULE h) {
-    std::lock_guard lock(loader_mutex());
-    for (auto& p : pseudos())
+    std::lock_guard lock(*g_loader_mutex);
+    for (auto& p : *g_pseudos)
         if (reinterpret_cast<HMODULE>(&p) == h) return &p;
     return nullptr;
 }
@@ -233,10 +229,8 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
             IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
         if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
         {
-            static auto* m = new std::mutex;
-            static auto* seen = new std::set<std::string>;
-            std::lock_guard lock(*m);
-            if (seen->insert(p->dll + "!" + what).second)
+            std::lock_guard lock(*g_missing_export_mutex);
+            if (g_missing_exports->insert(p->dll + "!" + what).second)
                 std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): not served\n", p->dll.c_str(), what.c_str());
         }
         SetLastError(ERROR_PROC_NOT_FOUND);

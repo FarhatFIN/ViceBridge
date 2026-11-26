@@ -19,6 +19,7 @@
 // of the counter's own word through a raw view. The bytes read back are compared with the host's; with no host D3D12
 // the layer's are compared with the model of uav_clear.h.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "d3d12_copy_compare.h"
@@ -608,7 +609,7 @@ int main() {
         std::printf("SKIP: the device lacks the descriptor indexing features of the bindless set 0\n");
         return 77;
     }
-    const std::filesystem::path root_dir = LEONIDA_TEST_BUFFER_UAV_DIR;
+    const std::filesystem::path root_dir = vktest::shader_fixture_directory(LEONIDA_TEST_BUFFER_UAV_DIR);
 
     unsigned words = 0;
     if (const int status = run_shaders(d, root_dir, words)) return status;

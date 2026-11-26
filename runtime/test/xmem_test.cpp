@@ -21,6 +21,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "xmem_pages.h"
 
 namespace {
 
@@ -343,7 +344,8 @@ struct PhysicalApi {
 void test_physical_pages(const PhysicalApi& api) {
     constexpr uint64_t kPages = 4;
     auto* const window = static_cast<uint8_t*>(api.virtual_alloc(
-        nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+        nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23,
+        PAGE_READWRITE | PAGE_WRITECOMBINE | PAGE_GRAPHICS_READWRITE));
     check(window != nullptr, "XMemVirtualAlloc reserves a 64 KiB-page window");
     auto* const second = static_cast<uint8_t*>(api.virtual_alloc(
         nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
@@ -371,13 +373,35 @@ void test_physical_pages(const PhysicalApi& api) {
               "a mapped page is a read-write view with the window's protection");
     }
 
+    auto* alias = static_cast<uint8_t*>(rt::xmem::map_contiguous_physical_alias(window, kPages * kPage64k));
+    check(alias != nullptr, "contiguous mapping can open an independent writable alias");
+    if (alias) {
+        alias[kPage64k + 7] ^= 0x5a;
+        check(alias[kPage64k + 7] == window[kPage64k + 7], "the alias shares its backing with the guest");
+        alias[kPage64k + 7] ^= 0x5a;
+    }
+
     check(api.map(window, kPages, nullptr) == window, "XMemMapPhysicalPages with no page array unmaps");
     check(reserved_only(window) && reserved_only(window + 3 * kPage64k), "unmapped pages are reserved again");
+
+    check(rt::xmem::map_contiguous_physical_alias(window, kPage64k) == nullptr,
+          "unmapped pages cannot be aliased");
+    if (alias) {
+        check(*reinterpret_cast<const uint32_t*>(alias) == 0x1000, "an acquired view survives guest unmap");
+        check(UnmapViewOfFile(alias) != FALSE, "the alias can be released independently");
+    }
 
     // Remap in reverse order into the other window: each page keeps its contents.
     uint64_t reversed[kPages];
     for (uint64_t i = 0; i < kPages; ++i) reversed[i] = pages[kPages - 1 - i];
     check(api.map(second, kPages, reversed) == second, "the pages map into another window");
+    check(rt::xmem::map_contiguous_physical_alias(second, kPages * kPage64k) == nullptr,
+          "reordered pages cannot be aliased as one run");
+    auto composite = rt::xmem::map_physical_alias(second, kPages * kPage64k);
+    check(composite && page_holds(composite.get(), 0x4000u), "composite alias preserves reverse guest order");
+    if (composite)
+        check(page_holds(static_cast<const uint8_t*>(composite.get()) + 3 * kPage64k, 0x1000u),
+              "composite alias maps every run in guest order");
     bool kept = true;
     for (uint64_t i = 0; i < kPages; ++i) {
         kept &= page_holds(second + i * kPage64k, 0x1000u * static_cast<uint32_t>(kPages - i));
@@ -415,7 +439,7 @@ void test_physical_pages(const PhysicalApi& api) {
     const uint64_t bogus = 0x1fffff0;  // the highest page number, far above the few this test allocates
     check(api.map(window, 1, &bogus) == nullptr, "mapping a page number that was never allocated fails");
 
-    check(api.map(second, kPages, nullptr) == second, "unmap the second window");
+    // Keep the old guest mapping live while physical page numbers are recycled.
     check(api.free_pages(kPages, pages) == TRUE, "XMemFreePhysicalPages frees the pages");
     check(api.free_pages(1, pages) == FALSE, "freeing a page twice fails");
 
@@ -431,6 +455,14 @@ void test_physical_pages(const PhysicalApi& api) {
     }
     check(reused, "freed page numbers are reused");
     check(api.map(window, 1, again) == window && read_u32(window, 0) == 0, "a fresh page maps and reads as zero");
+    auto* retained = rt::xmem::map_contiguous_physical_alias(second + 3 * kPage64k, kPage64k);
+    check(retained && read_u32(retained, 4) == 0xfeedf00d,
+          "aliasing an existing mapping after page-number reuse opens the original backing");
+    if (retained) check(UnmapViewOfFile(retained) != FALSE, "release alias to the original backing");
+    check(api.map(second, kPages, nullptr) == second, "unmap the second window");
+    if (composite)
+        check(page_holds(composite.get(), 0x4000u), "composite alias survives guest unmap and page-number reuse");
+    composite.reset();
     api.map(window, 1, nullptr);
     api.free_pages(kPages, again);
 
@@ -475,7 +507,8 @@ void test_placeholders(const PhysicalApi& api) {
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
-void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
+void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc,
+                          XMemAllocatePhysicalPagesFn physical_alloc) {
     wchar_t temp[MAX_PATH];
     GetTempPathW(MAX_PATH, temp);
     const std::wstring path =
@@ -502,6 +535,14 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
         check(!invalid && GetLastError() == ERROR_INVALID_PARAMETER,
               "traced allocation failure preserves the Win32 error");
     }
+    uint64_t no_pages = 0;
+    check(physical_alloc && physical_alloc(0x10001, &no_pages, nullptr) &&
+              physical_alloc(0x10001, &no_pages, nullptr),
+          "traced zero-page requests succeed");
+    uint64_t one_page = 1;
+    check(physical_alloc && !physical_alloc(0x10001, &one_page, nullptr) &&
+              GetLastError() == ERROR_INVALID_PARAMETER,
+          "traced invalid physical allocation preserves the Win32 error");
     rt::startup_trace::close();
 
     std::ifstream in(path);
@@ -516,6 +557,10 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     check(count("\"kind\":\"xmem_attributes\"") == 6, "six events: two XMemAlloc words, three XMemFree words and one XMemVirtualAlloc word");
     check(count("\"api\":\"XMemVirtualAlloc\",\"attributes\":\"0x183\",\"size\":65536") == 1,
           "XMemVirtualAlloc 0x183 is recorded once, with its size");
+    check(v && count("\"requested_base\":\"0x0\",\"returned_base\":" +
+                         rt::startup_trace::quote(rt::startup_trace::hex(reinterpret_cast<uintptr_t>(v))) +
+                         ",\"allocation_type\":\"0x3000\",\"protect\":\"0x4\"") == 1,
+          "XMemVirtualAlloc trace records the successful base, allocation flags and protection");
     check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x5e50000\",\"size\":4096") == 1,
           "XMemAlloc 0x5e50000 is recorded once, with the size of the first call");
     check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x99\",\"size\":16") == 1, "XMemAlloc 0x99 is recorded once");
@@ -525,7 +570,12 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     check(count("\"kind\":\"xmem_virtual_alloc_failed\",\"address\":\"0x0\",\"size\":0,"
                 "\"allocation_type\":\"0x2000\",\"protect\":\"0x4\",\"last_error\":87") == 1,
           "only the failed reservation records the request and Win32 error");
-    check(count("\"caller\":\"") == 7, "every event names its caller");
+    check(count("\"kind\":\"xmem_physical_pages\",\"api\":\"XMemAllocatePhysicalPages\","
+                "\"attributes\":\"0x10001\",\"pages\":0") == 1,
+          "a physical allocation attribute is traced once");
+    check(count("\"kind\":\"xmem_physical_alloc_failed\",\"attributes\":\"0x10001\","
+                "\"pages\":1,\"last_error\":87") == 1, "physical allocation failure records the requested count");
+    check(count("\"caller\":\"") == 9, "every event names its caller");
     DeleteFileW(path.c_str());
 }
 
@@ -714,7 +764,7 @@ int main() {
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
     }
-    test_attribute_trace(alloc, free_mem, virtual_alloc);
+    test_attribute_trace(alloc, free_mem, virtual_alloc, physical.allocate);
     if (transfer) {
         test_transfer_memory(transfer);
         test_transfer_trace(transfer);

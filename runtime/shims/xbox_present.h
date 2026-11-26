@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -88,6 +89,25 @@ struct XboxPresentParameters {
     float ImmediateThresholdPercent;
 };
 
+// Single-plane x64 profile reported by TuxBox (commands.rs, revision 7b22d717).
+// Keep the unknown tail separate from ViceBridge's internal composition controls.
+struct XboxRetailPresentPlane {
+    std::uint64_t token;
+    UINT resource_count;
+    ID3D12Resource* const* resources;
+    const D3D12_RECT* source_rect;
+    const XboxViewRect* destination;
+    UINT color_space;
+    UINT reserved[7];
+};
+struct XboxRetailPresentParameters {
+    float immediate_threshold_percent;
+    UINT reserved[7];
+};
+static_assert(offsetof(XboxRetailPresentPlane, resources) == 16);
+static_assert(sizeof(XboxRetailPresentPlane) == 72);
+static_assert(sizeof(XboxRetailPresentParameters) == 32);
+
 class XboxPresentation {
 public:
     // `clock` null: real time (a steady high-resolution timer). Tests pass a leonida::ManualFrameClock, which must
@@ -136,6 +156,10 @@ public:
     // `params` may be null (threshold 0). ImmediateThresholdPercent: see XboxPresentParameters; a frame that was shown
     // at once has its display statistic's percent_scanned set and is counted in immediate_presents().
     HRESULT PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes, const XboxPresentParameters* params);
+    // Translates the observed SDR profile into the Vulkan presentation core.
+    // Other plane layouts and unknown options require separate ABI evidence.
+    HRESULT PresentRetailX(UINT count, const XboxRetailPresentPlane* plane,
+                           const XboxRetailPresentParameters* params);
     // SuspendX drops the interval, the origin event and the frames in flight, and refuses presents. ResumeX allows
     // presents again; SetFrameIntervalX and ScheduleFrameEventX must be called again before the next wait.
     HRESULT SuspendX(UINT flags);

@@ -9,6 +9,7 @@
 namespace {
 
 struct Snapshot {
+    DWORD thread;
     int argc;
     bool has_argv;
     bool has_wargv;
@@ -31,6 +32,7 @@ bool copy(C (&to)[N], const C* from) {
 }
 
 bool capture(Snapshot& s) {
+    s.thread = GetCurrentThreadId();
     s.argc = *__p___argc();
     char** args = *__p___argv();
     wchar_t** wargs = *__p___wargv();
@@ -53,8 +55,8 @@ bool matches(const Snapshot& a, const Snapshot& b) {
 
 #ifdef STARTUP_CMDLINE_DLL
 
-extern "C" __declspec(dllexport) bool __cdecl startup_cmdline_matches(const Snapshot* entry) {
-    return g_captured && matches(g_startup, *entry);
+extern "C" __declspec(dllexport) bool __cdecl startup_cmdline_matches(const Snapshot* entry, bool same_thread) {
+    return g_captured && matches(g_startup, *entry) && (!same_thread || g_startup.thread == entry->thread);
 }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
@@ -67,7 +69,7 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
 
 #else
 
-extern "C" __declspec(dllimport) bool __cdecl startup_cmdline_matches(const Snapshot* entry);
+extern "C" __declspec(dllimport) bool __cdecl startup_cmdline_matches(const Snapshot* entry, bool same_thread);
 
 namespace {
 void NTAPI startup_callback(PVOID, DWORD reason, PVOID) {
@@ -82,7 +84,10 @@ extern "C" __declspec(allocate(".CRT$XLB")) PIMAGE_TLS_CALLBACK g_startup_callba
 
 int main(int argc, char** argv) {
     Snapshot entry{};
-    bool ok = capture(entry) && g_captured && matches(g_startup, entry) && startup_cmdline_matches(&entry);
+    const bool same_thread = argc > 1 && std::strcmp(argv[1], "same-thread") == 0;
+    bool ok = capture(entry) && g_captured && matches(g_startup, entry) && startup_cmdline_matches(&entry, same_thread);
+    if (same_thread) ok = ok && g_startup.thread == entry.thread;
+    std::printf("startup thread: EXE attach=%lu, main=%lu\n", g_startup.thread, entry.thread);
     ok = ok && argc == entry.argc && entry.has_argv && !entry.has_wargv;
     for (int i = 0; ok && i < argc; ++i) ok = std::strcmp(argv[i], entry.argv[i]) == 0;
     std::printf("tiny_startup_cmdline: %s\n", ok ? "PASS" : "FAIL");

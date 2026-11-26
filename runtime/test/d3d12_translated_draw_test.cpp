@@ -36,6 +36,7 @@
 // build. On success it prints one marker line, after every check.
 #ifndef LEONIDA_M15_GUEST
 #include "vk_test_device.h"
+#include "shader_fixture_path.h"
 #endif
 #include "d3d12_test_shaders.h"
 #ifndef LEONIDA_M15_GUEST
@@ -122,7 +123,7 @@ int main() {
     EXPECT(device_status == vktest::DeviceStatus::ready);
 
     // The translator-style library the build wrote, and the FSSM programs its index entries are keyed by.
-    const std::filesystem::path root_dir = LEONIDA_TEST_M15_DIR;
+    const auto root_dir = vktest::shader_fixture_directory(LEONIDA_TEST_M15_DIR);
 #endif
     const auto vs_program = read_file(root_dir / "fssm" / "vs_m15.fssm");
     const auto ps_program = read_file(root_dir / "fssm" / "ps_m15.fssm");

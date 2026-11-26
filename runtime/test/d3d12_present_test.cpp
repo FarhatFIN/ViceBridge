@@ -8,6 +8,7 @@
 // so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
+#include "../shims/d3d12_trace.h"
 #include "window_station.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -303,6 +304,8 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
 }  // namespace
 
 int main() {
+    if (GetEnvironmentVariableW(L"VICEBRIDGE_TEST_PRESENT_TRACE", nullptr, 0))
+        rt::d3d12_trace::set_enabled(true);
     vktest::Device d;
     const auto device_status = d.initialize(true);
     if (device_status == vktest::DeviceStatus::unavailable) {

@@ -450,6 +450,8 @@ if(BUILD_TESTING)
   add_test(NAME xg_xs_linear COMMAND xg_xs_linear_test)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
+  add_executable(gfx10_compact_test test/gfx10_compact_test.cpp)
+  add_test(NAME gfx10_compact COMMAND gfx10_compact_test)
 
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
@@ -697,7 +699,7 @@ if(BUILD_TESTING)
     target_link_libraries(tiny_game_fixed PRIVATE xgameruntime_stub)
     target_compile_definitions(tiny_game_fixed PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
     target_compile_options(tiny_game_fixed PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    target_link_options(tiny_game_fixed PRIVATE /FIXED /DYNAMICBASE:NO /BASE:0x140000000)
+    target_link_options(tiny_game_fixed PRIVATE /FIXED /DYNAMICBASE:NO /BASE:0x140000000 /STACK:12582912)
     set_target_properties(tiny_game_fixed PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
@@ -1136,6 +1138,10 @@ if(BUILD_TESTING)
     add_test(NAME run_startup_cmdline COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_startup_cmdline>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_cmdline.cmake")
+    add_test(NAME run_startup_on_entry COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_startup_cmdline>"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -DATTACH_ON_ENTRY=ON
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_cmdline.cmake")
     add_test(NAME run_tiny_async COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_async>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_async.cmake")
@@ -1179,12 +1185,18 @@ if(BUILD_TESTING)
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run ${_tiny_game_test_path} -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run ${_tiny_game_test_path} -- hello 42 eh)
+    add_test(NAME run_tiny_game_fls COMMAND gta6rt --run ${_tiny_game_test_path} -- hello 42 fls)
+    add_test(NAME run_tiny_game_fls_on_entry
+             COMMAND gta6rt --run ${_tiny_game_test_path} --attach-on-entry -- hello 42 fls)
+
     # BUILD-1457: the stack a game thread gets. gta6rt_stack reads SizeOfStackReserve from the built loader (nothing
     # is run); run_tiny_game_stack asks Windows, on the entry thread and on a thread created with dwStackSize 0.
     add_test(NAME gta6rt_stack COMMAND "${CMAKE_COMMAND}"
              "-DTOOL=$<TARGET_FILE:gta6rt>" "-DWANT=${GTA6RT_STACK}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
     add_test(NAME run_tiny_game_stack COMMAND gta6rt --run ${_tiny_game_test_path} -- hello 42 stack)
+    add_test(NAME run_tiny_game_stack_on_entry
+             COMMAND gta6rt --run ${_tiny_game_fixed_test_path} --attach-on-entry -- hello 42 stack-12m)
     # GAME: is the game folder, absolute, when gta6rt is given a bare image name or `--game-dir .`.
     add_test(NAME run_tiny_game_dir COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
@@ -1316,8 +1328,8 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
     # The XDXR BVH builder: the GPU writes every case, then tools/xdxr_bvh.py validates and traces them.
-    set(LEONIDA_XDXR_OUT "${CMAKE_CURRENT_BINARY_DIR}/xdxr_build_cases")
-    file(MAKE_DIRECTORY "${LEONIDA_XDXR_OUT}")
+    set(LEONIDA_XDXR_OUT "xdxr_build_cases")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${LEONIDA_XDXR_OUT}")
     add_test(NAME xdxr_build COMMAND vk_xdxr_build_test "${LEONIDA_XDXR_OUT}")
     set_tests_properties(xdxr_build PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_SETUP xdxr_build_cases)
     find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -1378,12 +1390,12 @@ if(TARGET Vulkan::Headers)
     endforeach()
     if(BUILD_TESTING)
       add_test(NAME vk_overlapping_occlusion COMMAND vk_overlapping_occlusion_test
-               "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.vert.spv"
-               "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.frag.spv")
+               "overlapping_occlusion.vert.spv"
+               "overlapping_occlusion.frag.spv")
       # The same test as a device without pipelineStatisticsQuery runs it (MoltenVK), on whatever device is here.
       add_test(NAME vk_overlapping_occlusion_no_statistics COMMAND vk_overlapping_occlusion_test
-               "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.vert.spv"
-               "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.frag.spv" --no-statistics)
+               "overlapping_occlusion.vert.spv"
+               "overlapping_occlusion.frag.spv" --no-statistics)
       set_tests_properties(vk_overlapping_occlusion vk_overlapping_occlusion_no_statistics
                            PROPERTIES SKIP_RETURN_CODE 77)
     endif()
@@ -1478,8 +1490,8 @@ if(TARGET Vulkan::Headers)
     endforeach()
     if(BUILD_TESTING)
       add_test(NAME vk_binary_occlusion COMMAND vk_binary_occlusion_test
-               "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.vert.spv"
-               "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.frag.spv")
+               "binary_occlusion.vert.spv"
+               "binary_occlusion.frag.spv")
       set_tests_properties(vk_binary_occlusion PROPERTIES SKIP_RETURN_CODE 77)
     endif()
   endif()
@@ -1612,8 +1624,8 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_xdxr_rt_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_xdxr_rt_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_xdxr_rt_test PRIVATE /W4 /permissive- /utf-8)
-    set(LEONIDA_D3D12_XDXR_OUT "${CMAKE_CURRENT_BINARY_DIR}/d3d12_xdxr_cases")
-    file(MAKE_DIRECTORY "${LEONIDA_D3D12_XDXR_OUT}")
+    set(LEONIDA_D3D12_XDXR_OUT "d3d12_xdxr_cases")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${LEONIDA_D3D12_XDXR_OUT}")
     add_test(NAME d3d12_xdxr_rt COMMAND d3d12_xdxr_rt_test "${LEONIDA_D3D12_XDXR_OUT}")
     set_tests_properties(d3d12_xdxr_rt PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 FIXTURES_SETUP d3d12_xdxr_cases)
     find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -2197,10 +2209,10 @@ if(TARGET Vulkan::Headers)
         VERBATIM)
       add_custom_target(vk_bindless_shaders ALL DEPENDS ${LEONIDA_BINDLESS_FILES})
       add_dependencies(vk_bindless_test vk_bindless_shaders)
-      add_test(NAME vk_bindless_ps_tex COMMAND vk_bindless_test ${LEONIDA_BINDLESS_DIR}/spirv/vs_ids.spv
-               ${LEONIDA_BINDLESS_DIR}/spirv/ps_tex.spv)
-      add_test(NAME vk_bindless_ps_imgatomic COMMAND vk_bindless_test ${LEONIDA_BINDLESS_DIR}/spirv/vs_ids.spv
-               ${LEONIDA_BINDLESS_DIR}/spirv/ps_imgatomic.spv)
+      add_test(NAME vk_bindless_ps_tex COMMAND vk_bindless_test generated/bindless_shaders/spirv/vs_ids.spv
+               generated/bindless_shaders/spirv/ps_tex.spv)
+      add_test(NAME vk_bindless_ps_imgatomic COMMAND vk_bindless_test generated/bindless_shaders/spirv/vs_ids.spv
+               generated/bindless_shaders/spirv/ps_imgatomic.spv)
       set_tests_properties(vk_bindless_ps_tex vk_bindless_ps_imgatomic PROPERTIES SKIP_RETURN_CODE 77)
 
       # M2: a textured quad. vs_m2.asm and ps_m2.asm (the PS samples a T#/S# it loads from two descriptor tables) go
@@ -2233,6 +2245,10 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_m2_textured_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m2_textured COMMAND d3d12_m2_textured_test)
       set_tests_properties(d3d12_m2_textured PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_m2_tiled_upload COMMAND d3d12_m2_textured_test --tiled)
+      set_tests_properties(d3d12_m2_tiled_upload PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_m2_compact_upload COMMAND d3d12_m2_textured_test --compact)
+      set_tests_properties(d3d12_m2_compact_upload PROPERTIES SKIP_RETURN_CODE 77)
 
       # M2, formats: BC1 and BC7 textures with mip chains and an R8G8B8A8 2D array through the same descriptor path.
       # vs_m2.asm with ps_m2.asm (2D) and ps_m2_array.asm (2D array, slice 1.0 of the view).
@@ -3015,6 +3031,10 @@ if(TARGET Vulkan::Headers)
       add_executable(code_hooks_test test/code_hooks_test.cpp)
       target_link_libraries(code_hooks_test PRIVATE Vulkan::Headers)
       target_compile_definitions(code_hooks_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(TARGET gta6rt_tls_host)
+        add_dependencies(code_hooks_test gta6rt_tls_host)
+        target_compile_definitions(code_hooks_test PRIVATE VICEBRIDGE_TEST_TLS_HOST)
+      endif()
       add_test(NAME code_hooks COMMAND code_hooks_test)
     endif()
     # The subgroup size a pipeline stage asks for, from synthetic index entries and device properties.

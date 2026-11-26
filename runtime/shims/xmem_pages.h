@@ -4,11 +4,20 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace rt::xmem {
 
 // The size of one page XMemAllocatePhysicalPages hands out (shims/xmem.cpp).
 constexpr size_t kPhysicalPageBytes = 0x10000;
+
+// Opens an independent writable view of a 64 KiB-aligned guest range backed
+// by consecutive pages in one section. Returns null for holes or scattered
+// runs. The caller owns the view and must unmap it after GPU use ends.
+void* map_contiguous_physical_alias(const void* guest_address, size_t bytes);
+
+// A stable writable alias, assembled from the mapped pages in guest order.
+std::shared_ptr<void> map_physical_alias(const void* guest_address, size_t bytes);
 
 // Copies `size` bytes from `source` into the physical pages page_array names: the data starts `offset` bytes into
 // page_array[0] and runs on through the entries after it, (offset + size) rounded up to whole pages of them. The
